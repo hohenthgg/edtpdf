@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111318">
+  <title>Natural PDF Studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234fb8a8'/%3E%3Ctext x='16' y='22' font-family='Georgia,serif' font-size='18' font-weight='bold' text-anchor='middle' fill='%230d1412'%3EN%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app" class="app no-document">
+    <header class="topbar">
+      <div class="brand" title="Natural PDF Studio">
+        <div class="brand-mark">N</div>
+        <div>
+          <strong>Natural PDF Studio</strong>
+          <small id="documentSubtitle">editor local de PDF e A4</small>
+        </div>
+      </div>
+
+      <div class="toolbar toolbar-main">
+        <button id="newDocumentBtn" class="tool-btn" title="Criar documento A4">Novo A4</button>
+        <button id="openPdfBtn" class="tool-btn primary" title="Abrir um PDF">Abrir PDF</button>
+        <button id="openProjectBtn" class="tool-btn" title="Abrir projeto salvo">Abrir projeto</button>
+        <span class="divider"></span>
+        <button id="readModeBtn" class="tool-btn mode-btn">Leitura</button>
+        <button id="editModeBtn" class="tool-btn mode-btn active">Edição</button>
+      </div>
+
+      <div class="toolbar toolbar-format" id="formatToolbar">
+        <select id="fontFamily" title="Fonte">
+          <option value="Arial, sans-serif">Arial</option>
+          <option value="Georgia, serif">Georgia</option>
+          <option value="'Times New Roman', serif">Times New Roman</option>
+          <option value="Verdana, sans-serif">Verdana</option>
+          <option value="'Courier New', monospace">Courier New</option>
+        </select>
+        <input id="fontSize" class="font-size" type="number" min="6" max="96" step="1" value="12" title="Tamanho da fonte">
+        <button id="boldBtn" class="icon-btn" title="Negrito"><b>B</b></button>
+        <button id="italicBtn" class="icon-btn" title="Itálico"><i>I</i></button>
+        <button id="underlineBtn" class="icon-btn" title="Sublinhado"><u>U</u></button>
+        <button id="alignBtn" class="icon-btn" title="Alternar alinhamento">≡</button>
+        <input id="textColor" type="color" value="#111111" title="Cor do texto">
+        <input id="fillColor" type="color" value="#ffffff" title="Cor de fundo ou preenchimento">
+      </div>
+
+      <div class="toolbar toolbar-right">
+        <button id="zoomOutBtn" class="icon-btn" title="Diminuir zoom">−</button>
+        <span id="zoomLabel" class="zoom-label">100%</span>
+        <button id="zoomInBtn" class="icon-btn" title="Aumentar zoom">+</button>
+        <span class="divider"></span>
+        <button id="saveProjectBtn" class="tool-btn" title="Baixar o projeto editável (.json)">Salvar projeto</button>
+        <button id="exportHtmlBtn" class="tool-btn" title="Exportar como página HTML autônoma">HTML</button>
+        <button id="exportPdfBtn" class="tool-btn primary" title="Exportar o documento em PDF">PDF</button>
+      </div>
+    </header>
+
+    <aside class="left-panel">
+      <div class="panel-heading">
+        <div>
+          <strong>Páginas</strong>
+          <span id="pageCountLabel">0</span>
+        </div>
+        <button id="addPageBtn" class="icon-btn" title="Adicionar página A4">+</button>
+      </div>
+      <div id="pageList" class="page-list"></div>
+      <div class="page-actions">
+        <button id="movePageUpBtn" title="Mover página para cima">↑</button>
+        <button id="movePageDownBtn" title="Mover página para baixo">↓</button>
+        <button id="duplicatePageBtn" title="Duplicar página">Duplicar</button>
+        <button id="deletePageBtn" class="danger" title="Excluir página">Excluir</button>
+      </div>
+    </aside>
+
+    <main id="workspace" class="workspace">
+      <div id="emptyState" class="empty-state">
+        <div class="empty-card">
+          <div class="empty-icon">A4</div>
+          <h1>Leia, edite ou crie documentos</h1>
+          <p>Abra um PDF por vez para leitura e edição visual, ou comece com páginas A4 editáveis. O processamento acontece no navegador.</p>
+          <div class="empty-actions">
+            <button id="emptyOpenPdfBtn" class="primary large">Abrir um PDF</button>
+            <button id="emptyNewDocumentBtn" class="large">Criar A4</button>
+          </div>
+          <div id="restoreSessionBox" class="restore-session hidden">
+            <span>Há uma sessão salva neste navegador.</span>
+            <button id="restoreSessionBtn">Restaurar sessão</button>
+            <button id="discardSessionBtn" class="text-btn">Descartar</button>
+          </div>
+          <small>Para editar texto original de um PDF, dê duplo clique sobre o texto renderizado. O editor cria uma camada substituta sobre o conteúdo original.</small>
+        </div>
+      </div>
+      <div id="pagesHost" class="pages-host"></div>
+    </main>
+
+    <aside class="right-panel">
+      <section class="tool-section">
+        <h3>Inserir</h3>
+        <div class="insert-grid">
+          <button id="addTextBtn"><span>T</span>Texto</button>
+          <button id="addWhiteoutBtn"><span>□</span>Cobrir</button>
+          <button id="addHighlightBtn"><span>▰</span>Realce</button>
+          <button id="addImageBtn"><span>▧</span>Imagem</button>
+        </div>
+      </section>
+
+      <section class="tool-section" id="selectionSection">
+        <h3>Elemento selecionado</h3>
+        <div id="noSelectionHint" class="muted-box">Selecione um texto, imagem ou forma.</div>
+        <div id="selectionControls" class="selection-controls hidden">
+          <label>Posição e tamanho</label>
+          <div class="four-grid">
+            <input id="elementX" type="number" step="1" title="X">
+            <input id="elementY" type="number" step="1" title="Y">
+            <input id="elementW" type="number" step="1" min="4" title="Largura">
+            <input id="elementH" type="number" step="1" min="4" title="Altura">
+          </div>
+          <label>Opacidade</label>
+          <input id="elementOpacity" type="range" min="0.05" max="1" step="0.05" value="1">
+          <div class="row-buttons">
+            <button id="bringFrontBtn">Trazer à frente</button>
+            <button id="sendBackBtn">Enviar atrás</button>
+          </div>
+          <div class="row-buttons">
+            <button id="duplicateElementBtn">Duplicar</button>
+            <button id="deleteElementBtn" class="danger">Excluir</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="tool-section">
+        <h3>Página A4</h3>
+        <label for="marginPreset">Margens</label>
+        <select id="marginPreset">
+          <option value="normal">Normal — 25,4 mm</option>
+          <option value="abnt">ABNT — 30/20/30/20 mm</option>
+          <option value="compact">Compacta — 15 mm</option>
+          <option value="wide">Ampla — 32 mm</option>
+        </select>
+        <label for="lineHeightSelect">Espaçamento</label>
+        <select id="lineHeightSelect">
+          <option value="1.15">1,15</option>
+          <option value="1.5" selected>1,5</option>
+          <option value="2">2,0</option>
+        </select>
+        <button id="applyPageSettingsBtn">Aplicar à página</button>
+      </section>
+
+      <section class="tool-section compact-help">
+        <h3>Atalhos</h3>
+        <p><kbd>Ctrl</kbd> + <kbd>Z</kbd> desfaz a última ação.</p>
+        <p><kbd>Ctrl</kbd> + <kbd>S</kbd> salva a sessão.</p>
+        <p><kbd>Delete</kbd> exclui o elemento selecionado.</p>
+        <p><kbd>Ctrl</kbd> + rolagem ajusta o zoom.</p>
+        <p>Duplo clique no texto do PDF cria uma caixa editável.</p>
+        <p>Arraste um PDF ou imagem para a janela para abrir.</p>
+      </section>
+    </aside>
+
+    <div id="pageFloatToolbar" class="page-float-toolbar hidden">
+      <button id="floatAddText">+ Texto</button>
+      <button id="floatAddImage">Imagem</button>
+      <button id="floatDuplicate">Duplicar</button>
+      <button id="floatDelete" class="danger">Excluir</button>
+    </div>
+  </div>
+
+  <dialog id="newDocumentDialog" class="modal-dialog">
+    <form method="dialog" id="newDocumentForm">
+      <button value="default" hidden aria-hidden="true" tabindex="-1"></button>
+      <header>
+        <h2>Novo documento A4</h2>
+        <button value="cancel" class="close-btn" aria-label="Fechar">×</button>
+      </header>
+      <div class="dialog-body">
+        <label>Título do documento
+          <input id="newDocumentTitle" type="text" value="Documento sem título" autofocus required>
+        </label>
+        <label>Número inicial de páginas
+          <input id="newDocumentPages" type="number" min="1" max="100" value="1">
+        </label>
+        <label>Modelo de margens
+          <select id="newDocumentMargins">
+            <option value="normal">Normal — 25,4 mm</option>
+            <option value="abnt">ABNT — 30/20/30/20 mm</option>
+            <option value="compact">Compacta — 15 mm</option>
+            <option value="wide">Ampla — 32 mm</option>
+          </select>
+        </label>
+        <label>Espaçamento entre linhas
+          <select id="newDocumentLineHeight">
+            <option value="1.15">1,15</option>
+            <option value="1.5" selected>1,5</option>
+            <option value="2">2,0</option>
+          </select>
+        </label>
+      </div>
+      <footer>
+        <button value="cancel">Cancelar</button>
+        <button id="createDocumentConfirmBtn" value="default" class="primary">Criar documento</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="confirmDialog" class="modal-dialog small-dialog">
+    <form method="dialog">
+      <header><h2 id="confirmTitle">Confirmar</h2></header>
+      <div class="dialog-body"><p id="confirmMessage"></p></div>
+      <footer>
+        <button value="cancel">Cancelar</button>
+        <button id="confirmOkBtn" value="default" class="primary">Continuar</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div id="progressOverlay" class="progress-overlay hidden" aria-live="polite">
+    <div class="progress-card">
+      <div class="spinner"></div>
+      <strong id="progressTitle">Processando</strong>
+      <span id="progressText">Aguarde…</span>
+      <div class="progress-track"><i id="progressBar"></i></div>
+    </div>
+  </div>
+
+  <div class="drop-hint" aria-hidden="true">
+    <div class="drop-hint-card">Solte aqui um PDF, uma imagem ou um projeto .json</div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <input id="pdfFileInput" type="file" accept="application/pdf,.pdf" hidden>
+  <input id="projectFileInput" type="file" accept="application/json,.json" hidden>
+  <input id="imageFileInput" type="file" accept="image/*" hidden>
+
+  <script src="vendor/pdf.min.js"></script>
+  <script src="vendor/html2canvas.min.js"></script>
+  <script src="vendor/jspdf.umd.min.js"></script>
+  <script src="vendor/jszip.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

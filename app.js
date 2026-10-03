@@ -7,6 +7,7 @@
   const A4_WIDTH_PX = 210 * 96 / 25.4;
   const A4_HEIGHT_PX = 297 * 96 / 25.4;
   const PDF_CSS_SCALE = 96 / 72;
+  const MAX_CANVAS_PIXELS = 16 * 1024 * 1024;
   const DB_NAME = 'natural-pdf-studio';
   const DB_STORE = 'sessions';
   const DB_KEY = 'current';
@@ -64,6 +65,8 @@
   let pointerOperation = null;
   let isExporting = false;
   const renderPromises = new Map();
+  let exportPixelRatio = 1;
+  let pdfRerenderTimer = null;
 
   if (window.pdfjsLib) {
     window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
@@ -319,6 +322,7 @@
       const paper = $('.paper', shell);
       paper.style.transform = `scale(${state.zoom})`;
     });
+    schedulePdfRerender();
     scheduleSessionSave();
   }
 
@@ -507,20 +511,46 @@
     currentPageObserver = null;
   }
 
+  // Pixels do canvas por pixel CSS da página. A página é ampliada com
+  // transform: scale(zoom), então o canvas precisa acompanhar o zoom e a
+  // densidade da tela para não ser esticado (e ficar borrado).
+  function pdfPixelRatio(pageState) {
+    const dpr = window.devicePixelRatio || 1;
+    const wanted = isExporting ? Math.max(dpr, exportPixelRatio) : dpr * (state.zoom || 1);
+    const area = Math.max(1, pageState.width * pageState.height);
+    return Math.max(1, Math.min(wanted, Math.sqrt(MAX_CANVAS_PIXELS / area)));
+  }
+
+  function needsPdfRender(pageState, paper) {
+    if (paper.dataset.rendered !== '1') return true;
+    const current = Number(paper.dataset.pixelRatio) || 0;
+    const target = pdfPixelRatio(pageState);
+    return Math.abs(current - target) > target * 0.05;
+  }
+
   async function ensurePdfPageRendered(pageId) {
     const pageState = getPage(pageId);
     const paper = $(`#paper-${CSS.escape(pageId)}`);
-    if (!pageState || pageState.type !== 'pdf' || !paper || paper.dataset.rendered === '1') return;
-    if (renderPromises.has(pageId)) return renderPromises.get(pageId);
+    if (!pageState || pageState.type !== 'pdf' || !paper) return;
+    if (renderPromises.has(pageId)) {
+      await renderPromises.get(pageId);
+      return ensurePdfPageRendered(pageId);
+    }
+    if (!needsPdfRender(pageState, paper)) return;
     if (!pdfDocument) throw new Error('Documento PDF não carregado.');
 
     const promise = (async () => {
       paper.dataset.rendering = '1';
       try {
+        const firstRender = paper.dataset.rendered !== '1';
         const sourcePage = await pdfDocument.getPage(pageState.sourcePageNumber);
         const viewport = sourcePage.getViewport({ scale: PDF_CSS_SCALE });
-        const canvas = $('.pdf-canvas', paper);
-        const outputScale = Math.min(window.devicePixelRatio || 1, 2);
+        const outputScale = pdfPixelRatio(pageState);
+        const oldCanvas = $('.pdf-canvas', paper);
+        // Desenha fora da tela e só troca no fim, para a página não piscar em branco ao mudar o zoom.
+        const canvas = document.createElement('canvas');
+        canvas.className = 'pdf-canvas';
+        canvas.setAttribute('aria-label', oldCanvas?.getAttribute('aria-label') || '');
         canvas.width = Math.floor(viewport.width * outputScale);
         canvas.height = Math.floor(viewport.height * outputScale);
         canvas.style.width = `${viewport.width}px`;
@@ -529,20 +559,48 @@
         const transform = outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
 
         await sourcePage.render({ canvasContext: context, viewport, transform, background: 'rgb(255,255,255)' }).promise;
-        const textContent = await sourcePage.getTextContent();
-        renderTextLayer(pageState, paper, viewport, textContent);
+        if (oldCanvas) {
+          oldCanvas.replaceWith(canvas);
+          oldCanvas.width = 1;
+          oldCanvas.height = 1;
+        } else {
+          paper.prepend(canvas);
+        }
+        paper.dataset.pixelRatio = String(outputScale);
+        if (firstRender) {
+          const textContent = await sourcePage.getTextContent();
+          renderTextLayer(pageState, paper, viewport, textContent);
+          createThumbnailFromCanvas(pageState, canvas);
+        }
         paper.dataset.rendered = '1';
-        createThumbnailFromCanvas(pageState, canvas);
       } finally {
         delete paper.dataset.rendering;
+        renderPromises.delete(pageId);
       }
     })();
 
     renderPromises.set(pageId, promise);
-    try {
-      await promise;
-    } finally {
-      renderPromises.delete(pageId);
+    return promise;
+  }
+
+  function schedulePdfRerender() {
+    clearTimeout(pdfRerenderTimer);
+    pdfRerenderTimer = setTimeout(() => rerenderNearbyPdfPages().catch(console.error), 180);
+  }
+
+  // Páginas longe da área visível são redesenhadas pelo observer quando voltarem a aparecer.
+  async function rerenderNearbyPdfPages() {
+    if (isExporting || !pdfDocument) return;
+    const view = dom.workspace.getBoundingClientRect();
+    const nearby = $$('.page-shell').filter(shell => {
+      const rect = shell.getBoundingClientRect();
+      return rect.bottom > view.top - 1300 && rect.top < view.bottom + 1300;
+    });
+    for (const shell of nearby) {
+      if (isExporting) return;
+      const pageId = shell.dataset.pageId;
+      if (getPage(pageId)?.type !== 'pdf') continue;
+      await ensurePdfPageRendered(pageId).catch(console.error);
     }
   }
 
@@ -1374,6 +1432,7 @@
 
       const count = state.pages.length;
       const renderScale = count <= 20 ? 1.75 : count <= 60 ? 1.35 : 1;
+      exportPixelRatio = renderScale;
       const jpegQuality = count <= 30 ? .92 : .86;
       const { jsPDF } = window.jspdf;
       let output = null;
@@ -1382,6 +1441,7 @@
         const page = state.pages[i];
         const paper = $(`#paper-${CSS.escape(page.id)}`);
         const wasRendered = page.type !== 'pdf' || paper?.dataset.rendered === '1';
+        const ratioBefore = paper?.dataset.pixelRatio;
         if (page.type === 'pdf') await ensurePdfPageRendered(page.id);
         updateProgress(`Convertendo página ${i + 1} de ${count}`, 8 + ((i + 1) / count) * 88);
         const canvas = await window.html2canvas(paper, {
@@ -1401,7 +1461,9 @@
         output.addImage(canvas.toDataURL('image/jpeg', jpegQuality), 'JPEG', 0, 0, widthPt, heightPt, undefined, 'FAST');
         canvas.width = 1;
         canvas.height = 1;
-        if (page.type === 'pdf' && !wasRendered && page.id !== previousPage) releasePdfPageRender(page.id);
+        // Páginas redesenhadas em alta resolução só para a exportação são liberadas; as próximas da tela voltam a ser desenhadas depois.
+        const ratioChanged = paper?.dataset.pixelRatio !== ratioBefore;
+        if (page.type === 'pdf' && (!wasRendered || ratioChanged) && page.id !== previousPage) releasePdfPageRender(page.id);
         await nextFrame();
       }
 
@@ -1413,6 +1475,7 @@
       showToast('Falha ao gerar o PDF. Use a impressão do navegador como alternativa.', 4000);
     } finally {
       isExporting = false;
+      exportPixelRatio = 1;
       document.body.classList.remove('export-mode');
       setZoom(previousZoom);
       state.currentPageId = previousPage;
@@ -1791,6 +1854,9 @@
       event.preventDefault();
       setZoom(state.zoom + (event.deltaY < 0 ? .1 : -.1));
     }, { passive: false });
+
+    // O zoom do navegador e a troca de monitor mudam o devicePixelRatio.
+    window.addEventListener('resize', schedulePdfRerender);
 
     let dragDepth = 0;
     window.addEventListener('dragenter', event => {

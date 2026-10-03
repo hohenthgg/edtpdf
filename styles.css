@@ -1,3 +1,13 @@
+/* Fontes DejaVu (licença em vendor/licenses): usadas ao editar PDFs feitos com elas. */
+@font-face { font-family: "DejaVu Sans"; src: local("DejaVu Sans"), local("DejaVuSans"), url("vendor/fonts/DejaVuSans.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "DejaVu Sans"; src: local("DejaVu Sans Bold"), local("DejaVuSans-Bold"), url("vendor/fonts/DejaVuSans-Bold.woff2") format("woff2"); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: "DejaVu Sans"; src: local("DejaVu Sans Oblique"), local("DejaVuSans-Oblique"), url("vendor/fonts/DejaVuSans-Oblique.woff2") format("woff2"); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: "DejaVu Sans"; src: local("DejaVu Sans Bold Oblique"), local("DejaVuSans-BoldOblique"), url("vendor/fonts/DejaVuSans-BoldOblique.woff2") format("woff2"); font-weight: 700; font-style: italic; font-display: swap; }
+@font-face { font-family: "DejaVu Serif"; src: local("DejaVu Serif"), local("DejaVuSerif"), url("vendor/fonts/DejaVuSerif.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "DejaVu Serif"; src: local("DejaVu Serif Bold"), local("DejaVuSerif-Bold"), url("vendor/fonts/DejaVuSerif-Bold.woff2") format("woff2"); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: "DejaVu Serif"; src: local("DejaVu Serif Italic"), local("DejaVuSerif-Italic"), url("vendor/fonts/DejaVuSerif-Italic.woff2") format("woff2"); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: "DejaVu Serif"; src: local("DejaVu Serif Bold Italic"), local("DejaVuSerif-BoldItalic"), url("vendor/fonts/DejaVuSerif-BoldItalic.woff2") format("woff2"); font-weight: 700; font-style: italic; font-display: swap; }
+
 /* Natural PDF Studio — interface escura, silenciosa e minimalista.
    O conteúdo (a página branca) é o protagonista; o restante recua. */
 
@@ -302,6 +312,17 @@ body.read-mode .margin-guide, body.export-mode .margin-guide { display: none; }
   white-space: pre-wrap;
   word-break: break-word;
   cursor: text;
+}
+/* Parágrafo convertido do PDF: altura acompanha o texto, sem margem interna. */
+.editor-element.flow[data-type="text"] .element-body {
+  position: relative;
+  inset: auto;
+  min-height: 1em;
+  padding: 0;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .editor-element[data-type="image"] .element-body { width: 100%; height: 100%; object-fit: contain; user-select: none; pointer-events: none; }
 .editor-element[data-type="rect"] .element-body, .editor-element[data-type="highlight"] .element-body { pointer-events: none; }

@@ -67,6 +67,12 @@
   const renderPromises = new Map();
   let exportPixelRatio = 1;
   let pdfRerenderTimer = null;
+  const textModels = new WeakMap(); // pdfDocument → Map(página original → linhas e parágrafos detectados)
+  const sourceCanvases = new WeakMap(); // .paper → desenho original do PDF.js, antes do reflow
+  const reflowFrames = new Map();
+  const pendingReflow = new Set(); // elementos ainda sendo medidos na conversão
+  const grownPagesWarned = new Set();
+  let reflowObserver = null;
 
   if (window.pdfjsLib) {
     window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
@@ -509,6 +515,7 @@
     currentPageObserver?.disconnect();
     pageRenderObserver = null;
     currentPageObserver = null;
+    reflowObserver?.disconnect();
   }
 
   // Pixels do canvas por pixel CSS da página. A página é ampliada com
@@ -559,19 +566,23 @@
         const transform = outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
 
         await sourcePage.render({ canvasContext: context, viewport, transform, background: 'rgb(255,255,255)' }).promise;
-        if (oldCanvas) {
-          oldCanvas.replaceWith(canvas);
-          oldCanvas.width = 1;
-          oldCanvas.height = 1;
+        // Com parágrafos reformatados, a tela mostra uma composição; o desenho do PDF.js fica guardado como fonte.
+        let visible = canvas;
+        if (pageHasReflow(pageState)) {
+          sourceCanvases.set(paper, canvas);
+          visible = composeReflowCanvas(pageState, paper, canvas);
         } else {
-          paper.prepend(canvas);
+          sourceCanvases.delete(paper);
+          paper._reflowOps = [];
         }
+        presentPdfCanvas(paper, visible, oldCanvas, canvas.getAttribute('aria-label'));
         paper.dataset.pixelRatio = String(outputScale);
         if (firstRender) {
           const textContent = await sourcePage.getTextContent();
-          renderTextLayer(pageState, paper, viewport, textContent);
+          renderTextLayer(pageState, paper, viewport, textContent, sourcePage);
           createThumbnailFromCanvas(pageState, canvas);
         }
+        applyReflowOffsetsToTextLayer(paper);
         paper.dataset.rendered = '1';
       } finally {
         delete paper.dataset.rendering;
@@ -604,10 +615,12 @@
     }
   }
 
-  function renderTextLayer(pageState, paper, viewport, textContent) {
+  function renderTextLayer(pageState, paper, viewport, textContent, sourcePage) {
     const layer = $('.text-layer', paper);
     layer.innerHTML = '';
     const styles = textContent.styles || {};
+    if (!textModels.has(pdfDocument)) textModels.set(pdfDocument, new Map());
+    textModels.get(pdfDocument).set(pageState.sourcePageNumber, buildTextModel(viewport, textContent, sourcePage));
 
     textContent.items.forEach((item, itemIndex) => {
       if (!item.str) return;
@@ -636,15 +649,19 @@
       span.dataset.fontSize = String(fontHeight);
       span.dataset.angle = String(angle);
       span.dataset.rawText = item.str;
+      span.dataset.baseLeft = String(tx[4]);
+      span.dataset.baseTop = String(tx[5] - fontAscent);
+      span.dataset.baseline = String(tx[5]);
 
-      if ((pageState.elements || []).some(element => String(element.sourceTextItem) === String(itemIndex))) {
-        span.classList.add('converted');
-      }
+      if (isTextItemConverted(pageState, itemIndex)) span.classList.add('converted');
       span.addEventListener('dblclick', event => {
         event.preventDefault();
         event.stopPropagation();
-        if (state.mode !== 'edit') return;
-        convertPdfTextToOverlay(pageState, span, paper);
+        if (state.mode !== 'edit' || span.classList.contains('converted')) return;
+        convertPdfParagraphToOverlay(pageState, span, paper, event).catch(error => {
+          console.error(error);
+          convertPdfTextToOverlay(pageState, span, paper);
+        });
       });
     });
   }
@@ -676,6 +693,791 @@
     selectElement(page.id, element.id);
     scheduleSessionSave();
     showToast('Texto convertido em camada editável.');
+  }
+
+  /* ── Reflow de parágrafos ────────────────────────────────────
+   * O duplo clique converte o parágrafo inteiro numa caixa de texto com a
+   * largura da coluna e altura automática. Quando a edição faz o parágrafo
+   * crescer, a imagem da página é cortada numa faixa livre logo abaixo dele e
+   * tudo o que vem depois desce junto (texto, tabelas, elementos inseridos).
+   * Coordenadas de element.reflow são as da página original, sem deslocamentos.
+   */
+
+  function isTextItemConverted(page, index) {
+    return (page.elements || []).some(element =>
+      String(element.sourceTextItem) === String(index) || element.reflow?.items?.includes(index));
+  }
+
+  function pageHasReflow(page) {
+    return (page.elements || []).some(element => element.reflow);
+  }
+
+  function getTextModel(page) {
+    return textModels.get(pdfDocument)?.get(page.sourcePageNumber) || null;
+  }
+
+  const KNOWN_FONT_STACKS = [
+    [/^dejavusansmono/, '"DejaVu Sans Mono", "Courier New"', 'monospace'],
+    [/^dejavusans/, '"DejaVu Sans"', 'sans-serif'],
+    [/^dejavuserif/, '"DejaVu Serif"', 'serif'],
+    [/^(arial|helvetica|liberationsans|arimo|nimbussans)/, 'Arial, Helvetica, "Liberation Sans", Arimo', 'sans-serif'],
+    [/^(timesnewroman|times|liberationserif|tinos|nimbusroman)/, '"Times New Roman", Times, "Liberation Serif", Tinos', 'serif'],
+    [/^(couriernew|courier|liberationmono|cousine|nimbusmono)/, '"Courier New", Courier, "Liberation Mono", Cousine', 'monospace'],
+    [/^calibri/, 'Calibri, Carlito', 'sans-serif'],
+    [/^cambria/, 'Cambria, Caladea', 'serif'],
+    [/^georgia/, 'Georgia', 'serif'],
+    [/^verdana/, 'Verdana', 'sans-serif'],
+    [/^(segoeui|segoe)/, '"Segoe UI"', 'sans-serif']
+  ];
+
+  function describePdfFont(sourcePage, fontName, style) {
+    let name = '';
+    try { name = sourcePage?.commonObjs.get(fontName)?.name || ''; } catch (error) { name = ''; }
+    const clean = name.replace(/^[A-Z]{6}\+/, '');
+    const bold = /bold|black|heavy|semibold|demi/i.test(clean);
+    const italic = /italic|oblique|kursiv/i.test(clean);
+    const baseName = clean.split(/[-,]/)[0].replace(/(PS)?MT$/, '').replace(/[^A-Za-z0-9]/g, '');
+    const lower = baseName.toLowerCase();
+    const known = KNOWN_FONT_STACKS.find(([pattern]) => pattern.test(lower));
+    let generic = /mono|courier|consol/i.test(clean) ? 'monospace'
+      : /sans/i.test(clean) ? 'sans-serif'
+      : /serif|times|roman|georgia|garamond|cambria|book|minion|palatino|baskerville|caslon|bodoni/i.test(clean) ? 'serif'
+      : (style.fontFamily === 'serif' || style.fontFamily === 'monospace' ? style.fontFamily : 'sans-serif');
+    let stack;
+    if (known) {
+      stack = known[1];
+      generic = known[2];
+    } else if (baseName) {
+      const spaced = baseName.replace(/([a-z])([A-Z])/g, '$1 $2');
+      stack = spaced === baseName ? `"${baseName}"` : `"${spaced}", "${baseName}"`;
+    } else {
+      stack = generic === 'serif' ? 'Georgia, "Times New Roman"' : generic === 'monospace' ? '"Courier New"' : 'Arial';
+    }
+    const css = `${stack}, ${generic}`;
+    return { css, bold, italic, key: `${css}|${bold}|${italic}` };
+  }
+
+  // Agrupa os trechos do PDF.js em linhas (mesma linha de base) e as linhas em
+  // segmentos separados por vãos largos (colunas, células de tabela).
+  function buildTextModel(viewport, textContent, sourcePage) {
+    const styles = textContent.styles || {};
+    const fonts = new Map();
+    const items = [];
+    textContent.items.forEach((item, index) => {
+      if (!item.str) return;
+      const tx = window.pdfjsLib.Util.transform(viewport.transform, item.transform);
+      const fs = Math.hypot(tx[2], tx[3]);
+      if (!fs || Math.abs(tx[1]) > 0.01 * fs || Math.abs(tx[2]) > 0.01 * fs) return;
+      const style = styles[item.fontName] || {};
+      if (!fonts.has(item.fontName)) fonts.set(item.fontName, describePdfFont(sourcePage, item.fontName, style));
+      const ascent = clamp(style.ascent ? style.ascent : style.descent ? 1 + style.descent : 0.8, 0.6, 1.1) * fs;
+      const descent = clamp(style.descent ? -style.descent : 0.2, 0.1, 0.4) * fs;
+      items.push({
+        index, str: item.str, blank: !item.str.trim(), fs, font: fonts.get(item.fontName),
+        x: tx[4], right: tx[4] + item.width * viewport.scale, baseline: tx[5], top: tx[5] - ascent, bottom: tx[5] + descent
+      });
+    });
+
+    const rows = [];
+    const findRow = item => {
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const row = rows[i];
+        if (row.baseline < item.baseline - 3 * item.fs) break;
+        if (Math.abs(row.baseline - item.baseline) <= 0.45 * Math.max(row.fs, item.fs)) return row;
+      }
+      return null;
+    };
+    const byBaseline = (a, b) => a.baseline - b.baseline || a.x - b.x;
+    items.filter(item => !item.blank).sort(byBaseline).forEach(item => {
+      const row = findRow(item);
+      if (row) {
+        row.items.push(item);
+        if (item.fs > row.fs) { row.fs = item.fs; row.baseline = item.baseline; }
+      } else {
+        rows.push({ baseline: item.baseline, fs: item.fs, items: [item] });
+        rows.sort((a, b) => a.baseline - b.baseline);
+      }
+    });
+    items.filter(item => item.blank).forEach(item => findRow(item)?.items.push(item));
+
+    const segments = [];
+    rows.forEach(row => {
+      row.items.sort((a, b) => a.x - b.x);
+      let current = null;
+      row.items.forEach(item => {
+        // Vãos medidos só entre trechos visíveis: há PDFs com "espaços" largos atravessando células.
+        if (current && !item.blank && item.x - current.reach > 0.9 * Math.max(row.fs, item.fs)) current = null;
+        if (!current) {
+          current = { items: [], reach: -Infinity };
+          segments.push(current);
+        }
+        current.items.push(item);
+        if (!item.blank) current.reach = Math.max(current.reach, item.right);
+      });
+    });
+
+    const segOfItem = new Map();
+    const result = [];
+    segments.forEach(segment => {
+      const solid = segment.items.filter(item => !item.blank);
+      if (!solid.length) return;
+      const main = solid.reduce((best, item) => (item.str.length * item.fs > best.str.length * best.fs ? item : best), solid[0]);
+      const sizes = new Map();
+      solid.forEach(item => {
+        const key = Math.round(item.fs * 10) / 10;
+        sizes.set(key, (sizes.get(key) || 0) + item.str.length);
+      });
+      const fs = [...sizes.entries()].sort((a, b) => b[1] - a[1])[0][0];
+      const seg = {
+        id: result.length,
+        items: segment.items,
+        fs,
+        baseline: main.baseline,
+        left: Math.min(...solid.map(item => item.x)),
+        right: Math.max(...solid.map(item => item.right)),
+        top: Math.min(...solid.map(item => item.top)),
+        bottom: Math.max(...solid.map(item => item.bottom))
+      };
+      segment.items.forEach(item => segOfItem.set(item.index, seg));
+      result.push(seg);
+    });
+    return {
+      segments: result,
+      segOfItem,
+      minLeft: result.length ? Math.min(...result.map(seg => seg.left)) : 72
+    };
+  }
+
+  function segmentFirstWordWidth(seg) {
+    const first = seg.items.find(item => !item.blank);
+    if (!first) return 0;
+    const word = first.str.trimStart().split(/\s+/)[0] || '';
+    return (first.right - first.x) * (word.length / Math.max(1, first.str.length));
+  }
+
+  function sameTextSize(a, b) {
+    return Math.abs(a - b) <= Math.max(0.6, 0.08 * Math.max(a, b));
+  }
+
+  function estimateColumnRight(model, bodyLeft, fs, lines) {
+    const linesRight = Math.max(...lines.map(line => line.right));
+    let right = linesRight;
+    // Linhas que começam no mesmo x (a coluna ou a célula) indicam até onde o texto vai.
+    model.segments.forEach(seg => {
+      if (Math.abs(seg.left - bodyLeft) <= 0.6 * fs) right = Math.max(right, seg.right);
+    });
+    // Linha isolada (título, item de lista): usa o texto vizinho que passa por baixo/cima dela.
+    if (right === linesRight && lines.length === 1) {
+      const line = lines[0];
+      model.segments.forEach(seg => {
+        if (seg !== line && Math.abs(seg.baseline - line.baseline) <= 10 * fs && seg.left <= bodyLeft + 1 && seg.right > right) right = seg.right;
+      });
+    }
+    // Não invade o que estiver à direita nas mesmas linhas (outra coluna ou célula).
+    lines.forEach(line => model.segments.forEach(seg => {
+      if (seg !== line && Math.abs(seg.baseline - line.baseline) <= 0.5 * fs && seg.left >= line.right - 0.5) {
+        right = Math.min(right, seg.left - 0.4 * fs);
+      }
+    }));
+    return Math.max(right, linesRight);
+  }
+
+  // A linha de baixo continua o parágrafo se a sua primeira palavra não teria
+  // cabido no fim da linha de cima (senão, a linha de cima terminou de propósito).
+  function linesContinue(upper, lower, colRight) {
+    const fs = upper.fs;
+    const upperText = upper.items.map(item => item.str).join('').trimEnd();
+    if (/[-‐]$/.test(upperText)) return true;
+    const remaining = colRight - upper.right;
+    return segmentFirstWordWidth(lower) + 0.25 * fs > remaining - 0.15 * fs;
+  }
+
+  function neighborLine(model, cur, direction, bodyLeft, colRight) {
+    const fs = cur.fs;
+    let best = null;
+    model.segments.forEach(seg => {
+      const dy = (seg.baseline - cur.baseline) * direction;
+      if (seg === cur || dy < 0.5 * fs || dy > 2.2 * fs || !sameTextSize(seg.fs, fs)) return;
+      if (seg.right <= bodyLeft - 4 * fs || seg.left >= colRight) return;
+      if (!best) { best = seg; return; }
+      const bestDy = (best.baseline - cur.baseline) * direction;
+      if (dy < bestDy - 0.3 * fs || (Math.abs(dy - bestDy) <= 0.3 * fs && Math.abs(seg.left - bodyLeft) < Math.abs(best.left - bodyLeft))) best = seg;
+    });
+    return best;
+  }
+
+  function detectParagraph(model, startSeg) {
+    const fs = startSeg.fs;
+    const lines = [startSeg];
+    let bodyLeft = startSeg.left;
+    let pitch = null;
+    let firstLineFound = false;
+
+    let cur = startSeg;
+    while (lines.length < 400) {
+      const colRight = estimateColumnRight(model, bodyLeft, fs, lines);
+      const next = neighborLine(model, cur, 1, bodyLeft, colRight);
+      if (!next) break;
+      const dy = next.baseline - cur.baseline;
+      if (dy < 0.9 * fs || dy > 2 * fs || (pitch && Math.abs(dy - pitch) > 0.2 * pitch)) break;
+      let aligned = Math.abs(next.left - bodyLeft) <= 0.6 * fs;
+      let newBodyLeft = bodyLeft;
+      // A linha clicada pode ser a primeira, com recuo ou marcador (as demais começam noutro x).
+      if (!aligned && lines.length === 1 && Math.abs(next.left - cur.left) <= 4 * fs) {
+        aligned = true;
+        newBodyLeft = next.left;
+      }
+      if (!aligned || !linesContinue(cur, next, estimateColumnRight(model, newBodyLeft, fs, [...lines, next]))) break;
+      if (newBodyLeft !== bodyLeft) firstLineFound = true;
+      bodyLeft = newBodyLeft;
+      pitch ||= dy;
+      lines.push(next);
+      cur = next;
+    }
+
+    cur = lines[0];
+    while (!firstLineFound && lines.length < 400) {
+      const colRight = estimateColumnRight(model, bodyLeft, fs, lines);
+      const prev = neighborLine(model, cur, -1, bodyLeft, colRight);
+      if (!prev) break;
+      const dy = cur.baseline - prev.baseline;
+      if (dy < 0.9 * fs || dy > 2 * fs || (pitch && Math.abs(dy - pitch) > 0.2 * pitch)) break;
+      const aligned = Math.abs(prev.left - bodyLeft) <= 0.6 * fs;
+      const isFirstLine = !aligned && Math.abs(prev.left - bodyLeft) <= 4 * fs;
+      if (!(aligned || isFirstLine) || !linesContinue(prev, cur, colRight)) break;
+      pitch ||= dy;
+      lines.unshift(prev);
+      cur = prev;
+      if (isFirstLine) break;
+    }
+
+    const colRight = estimateColumnRight(model, bodyLeft, fs, lines);
+    return {
+      lines,
+      fs,
+      bodyLeft,
+      firstLeft: lines[0].left,
+      colRight,
+      pitch: pitch || typicalLinePitch(model, startSeg),
+      left: Math.min(...lines.map(line => line.left)),
+      right: Math.max(...lines.map(line => line.right)),
+      top: Math.min(...lines.map(line => line.top)),
+      bottom: Math.max(...lines.map(line => line.bottom))
+    };
+  }
+
+  function typicalLinePitch(model, seg) {
+    let best = Infinity;
+    model.segments.forEach(other => {
+      const dy = Math.abs(other.baseline - seg.baseline);
+      if (other !== seg && sameTextSize(other.fs, seg.fs) && Math.abs(other.left - seg.left) <= 0.6 * seg.fs && dy >= 0.9 * seg.fs && dy <= 2 * seg.fs) best = Math.min(best, dy);
+    });
+    return Number.isFinite(best) ? best : seg.fs * 1.2;
+  }
+
+  function paragraphHtml(para, baseFont) {
+    const wrapRun = run => {
+      let html = escapeHtml(run.text);
+      if (!html) return '';
+      if (run.font.css !== baseFont.css) html = `<span style="font-family:${run.font.css.replace(/"/g, "'")}">${html}</span>`;
+      if (run.font.italic !== baseFont.italic) html = run.font.italic ? `<i>${html}</i>` : `<span style="font-style:normal">${html}</span>`;
+      if (run.font.bold !== baseFont.bold) html = run.font.bold ? `<b>${html}</b>` : `<span style="font-weight:400">${html}</span>`;
+      return html;
+    };
+    let html = '';
+    let previousText = '';
+    para.lines.forEach((line, lineIndex) => {
+      const runs = [];
+      let prev = null;
+      line.items.forEach(item => {
+        let text = item.str;
+        if (prev && !prev.blank && !item.blank && item.x - prev.right > 0.15 * item.fs && !/\s$/.test(prev.str) && !/^\s/.test(text)) text = ` ${text}`;
+        const font = item.blank && runs.length ? runs[runs.length - 1].font : item.font;
+        const last = runs[runs.length - 1];
+        if (last && last.font.key === font.key) last.text += text;
+        else runs.push({ font, text });
+        prev = item;
+      });
+      if (runs.length) {
+        runs[0].text = runs[0].text.trimStart();
+        runs[runs.length - 1].text = runs[runs.length - 1].text.trimEnd();
+      }
+      const lineText = runs.map(run => run.text).join('');
+      if (lineIndex > 0 && !/[-‐]$/.test(previousText)) html += ' ';
+      html += runs.map(wrapRun).join('');
+      previousText = lineText;
+    });
+    return html;
+  }
+
+  function dominantFont(para) {
+    const weights = new Map();
+    para.lines.forEach(line => line.items.forEach(item => {
+      if (item.blank) return;
+      const entry = weights.get(item.font.key) || { font: item.font, chars: 0 };
+      entry.chars += item.str.length;
+      weights.set(item.font.key, entry);
+    }));
+    return [...weights.values()].sort((a, b) => b.chars - a.chars)[0]?.font || { css: 'Arial, sans-serif', bold: false, italic: false, key: 'default' };
+  }
+
+  function toHex(r, g, b) {
+    return `#${[r, g, b].map(value => Math.round(value).toString(16).padStart(2, '0')).join('')}`;
+  }
+
+  // Cor de fundo = cor mais frequente na área do parágrafo; cor do texto = pixels mais distantes dela.
+  function sampleParagraphColors(source, ratio, box) {
+    try {
+      const sx = clamp(Math.floor(box.x * ratio), 0, source.width - 1);
+      const sy = clamp(Math.floor(box.y * ratio), 0, source.height - 1);
+      const sw = clamp(Math.ceil(box.w * ratio), 1, source.width - sx);
+      const sh = clamp(Math.ceil(box.h * ratio), 1, source.height - sy);
+      const data = source.getContext('2d').getImageData(sx, sy, sw, sh).data;
+      const bins = new Map();
+      for (let i = 0; i < data.length; i += 4) {
+        const key = (data[i] >> 4) << 8 | (data[i + 1] >> 4) << 4 | (data[i + 2] >> 4);
+        const bin = bins.get(key) || [0, 0, 0, 0];
+        bin[0]++; bin[1] += data[i]; bin[2] += data[i + 1]; bin[3] += data[i + 2];
+        bins.set(key, bin);
+      }
+      const top = [...bins.values()].sort((a, b) => b[0] - a[0])[0];
+      const bg = [top[1] / top[0], top[2] / top[0], top[3] / top[0]];
+      const distance = i => Math.abs(data[i] - bg[0]) + Math.abs(data[i + 1] - bg[1]) + Math.abs(data[i + 2] - bg[2]);
+      let max = 0;
+      for (let i = 0; i < data.length; i += 4) max = Math.max(max, distance(i));
+      let text = '#111111';
+      if (max > 90) {
+        const sum = [0, 0, 0, 0];
+        for (let i = 0; i < data.length; i += 4) {
+          if (distance(i) >= max * 0.8) { sum[0]++; sum[1] += data[i]; sum[2] += data[i + 1]; sum[3] += data[i + 2]; }
+        }
+        text = toHex(sum[1] / sum[0], sum[2] / sum[0], sum[3] / sum[0]);
+      }
+      return { bg: toHex(...bg), text };
+    } catch (error) {
+      return { bg: '#ffffff', text: '#111111' };
+    }
+  }
+
+  function mergeTextBlocks(segments) {
+    const blocks = [];
+    [...segments].sort((a, b) => a.top - b.top).forEach(seg => {
+      const block = blocks.find(item => seg.left < item.right && item.left < seg.right && seg.top - item.bottom <= 0.9 * Math.max(seg.fs, item.fs));
+      if (block) {
+        block.left = Math.min(block.left, seg.left);
+        block.right = Math.max(block.right, seg.right);
+        block.bottom = Math.max(block.bottom, seg.bottom);
+        block.fs = Math.max(block.fs, seg.fs);
+      } else {
+        blocks.push({ left: seg.left, right: seg.right, top: seg.top, bottom: seg.bottom, fs: seg.fs });
+      }
+    });
+    return blocks;
+  }
+
+  // Escolhe onde cortar a página para empurrar o conteúdo abaixo do parágrafo.
+  // Corte de largura total: numa faixa sem texto e sem bordas horizontais, sem
+  // partir parágrafos de outras colunas. Se não houver, só a coluna desce.
+  function computeReflowCut(model, para, source, ratio, page) {
+    const own = new Set(para.lines);
+    const fs = para.fs;
+    const colLeft = para.left;
+    const colRight = para.colRight;
+    const baseHeight = pageBaseHeight(page);
+    const others = model.segments.filter(seg => !own.has(seg));
+    const inColumn = seg => seg.right > colLeft + 0.5 && seg.left < colRight - 0.5;
+    const columnLines = others.filter(inColumn);
+    const below = columnLines.filter(seg => seg.top >= para.bottom - 0.5);
+    const nextOwnTop = below.length ? Math.min(...below.map(seg => seg.top)) : baseHeight - 1;
+    const foreignBlocks = mergeTextBlocks(others.filter(seg => !inColumn(seg)));
+    const yStart = Math.min(para.bottom, nextOwnTop);
+    const yEnd = Math.max(yStart, Math.min(nextOwnTop, baseHeight - 1));
+
+    let band = null;
+    let bandTop = 0;
+    try {
+      bandTop = clamp(Math.floor((yStart - 2) * ratio), 0, source.height - 1);
+      const bandBottom = clamp(Math.ceil((yEnd + 2) * ratio), bandTop + 1, source.height);
+      band = source.getContext('2d').getImageData(0, bandTop, source.width, bandBottom - bandTop);
+    } catch (error) {
+      band = null;
+    }
+    const homogeneous = (y, x0, x1) => {
+      if (!band) return true;
+      const row = Math.round(y * ratio) - bandTop;
+      if (row < 1 || row + 1 >= band.height) return true;
+      const start = clamp(Math.floor(x0 * ratio), 0, band.width);
+      const end = clamp(Math.ceil(x1 * ratio), start, band.width);
+      let differing = 0;
+      for (let x = start; x < end; x++) {
+        const a = ((row - 1) * band.width + x) * 4;
+        const b = ((row + 1) * band.width + x) * 4;
+        const diff = Math.abs(band.data[a] - band.data[b]) + Math.abs(band.data[a + 1] - band.data[b + 1]) + Math.abs(band.data[a + 2] - band.data[b + 2]);
+        if (diff > 60) differing++;
+      }
+      return differing <= Math.max(2, (end - start) * 0.003);
+    };
+    const outside = (y, boxes) => !boxes.some(box => y > box.top - 0.5 && y < box.bottom + 0.5);
+
+    for (let y = yStart + 0.5; y <= yEnd; y += 0.5) {
+      if (outside(y, others) && outside(y, foreignBlocks) && homogeneous(y, 0, page.width)) {
+        return { cut: y, x0: 0, x1: page.width, free: Math.max(0, y - para.bottom - 1) };
+      }
+    }
+    const x0 = Math.max(0, colLeft - 0.6 * fs);
+    const x1 = Math.min(page.width, colRight + 0.6 * fs);
+    for (let y = yStart + 0.5; y <= yEnd; y += 0.5) {
+      if (outside(y, columnLines) && homogeneous(y, x0, x1)) return { cut: y, x0, x1, free: 0 };
+    }
+    return { cut: yEnd, x0, x1, free: 0 };
+  }
+
+  function pageBaseHeight(page) {
+    return page.originalHeightPt ? page.originalHeightPt * PDF_CSS_SCALE : page.height;
+  }
+
+  // Empurrões ativos da página, em ordem de corte. Parágrafos que cortam na mesma
+  // altura (células da mesma linha de uma tabela) empurram pelo maior deles.
+  function buildReflowOps(page) {
+    const ops = [];
+    (page.elements || [])
+      .filter(element => element.reflow && element.reflow.pushed > 0.25)
+      .sort((a, b) => a.reflow.cut - b.reflow.cut)
+      .forEach(element => {
+        const flow = element.reflow;
+        const same = ops.find(op => Math.abs(op.cut - flow.cut) < 1 && op.x0 < flow.x1 && flow.x0 < op.x1);
+        if (same) {
+          same.push = Math.max(same.push, flow.pushed);
+          same.x0 = Math.min(same.x0, flow.x0);
+          same.x1 = Math.max(same.x1, flow.x1);
+        } else {
+          ops.push({ cut: flow.cut, x0: flow.x0, x1: flow.x1, push: flow.pushed });
+        }
+      });
+    return ops;
+  }
+
+  // Quanto um ponto da página original (x, y) foi deslocado para baixo.
+  function reflowOffsetAt(ops, x, y) {
+    return ops.reduce((sum, op) => (op.cut <= y && x >= op.x0 && x <= op.x1 ? sum + op.push : sum), 0);
+  }
+
+  function lastContentRow(source, ratio) {
+    if (source._lastContentRow != null) return source._lastContentRow;
+    let last = 0;
+    try {
+      const { width, height } = source;
+      const data = source.getContext('2d').getImageData(0, 0, width, height).data;
+      outer: for (let y = height - 1; y >= 0; y--) {
+        for (let x = 0; x < width; x++) {
+          const i = (y * width + x) * 4;
+          if (data[i] < 235 || data[i + 1] < 235 || data[i + 2] < 235) { last = y; break outer; }
+        }
+      }
+    } catch (error) {
+      last = source.height;
+    }
+    source._lastContentRow = last / ratio;
+    return source._lastContentRow;
+  }
+
+  function setPdfPageHeight(page, paper, height) {
+    if (Math.abs(page.height - height) < 0.5) return;
+    const grewNow = height > pageBaseHeight(page) + 0.5 && page.height <= pageBaseHeight(page) + 0.5;
+    page.height = height;
+    paper.style.height = `${height}px`;
+    const shell = paper.closest('.page-shell');
+    if (shell) shell.style.height = `${height * state.zoom}px`;
+    if (grewNow && !grownPagesWarned.has(page.id)) {
+      grownPagesWarned.add(page.id);
+      const index = state.pages.indexOf(page) + 1;
+      showToast(`A página ${index} foi alongada para não cortar o conteúdo empurrado pelo texto.`, 4200);
+    }
+    scheduleSessionSave();
+  }
+
+  function composeReflowCanvas(page, paper, source) {
+    const flows = (page.elements || []).filter(element => element.reflow);
+    const ratio = source.width / page.width;
+    const ops = buildReflowOps(page);
+    paper._reflowOps = ops;
+
+    // A página só cresce se o conteúdo empurrado (ou o próprio texto editado)
+    // passar da margem inferior; o espaço em branco do rodapé é usado antes.
+    const baseHeight = pageBaseHeight(page);
+    let height = baseHeight;
+    if (flows.length) {
+      const last = lastContentRow(source, ratio);
+      const margin = Math.max(...flows.map(element => element.reflow.margin || 48));
+      const limit = Math.max(baseHeight - margin, last);
+      const shift = Math.max(0, ...ops.map(op => reflowOffsetAt(ops, (op.x0 + op.x1) / 2, last)));
+      const textBottom = Math.max(...flows.map(element => element.y + element.h));
+      height = baseHeight + Math.max(0, Math.ceil(Math.max(last + shift, textBottom) - limit));
+    }
+    setPdfPageHeight(page, paper, height);
+    if (!flows.length) return source;
+
+    const out = document.createElement('canvas');
+    out.width = source.width;
+    out.height = Math.round(height * ratio);
+    const ctx = out.getContext('2d', { alpha: false });
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, out.width, out.height);
+    ctx.drawImage(source, 0, 0);
+    // Apaga o texto original dos parágrafos convertidos (a caixa editável o substitui).
+    flows.forEach(element => {
+      const box = element.reflow.box;
+      ctx.fillStyle = element.reflow.bg || '#ffffff';
+      ctx.fillRect(Math.floor((box.x - 1) * ratio), Math.floor(box.y * ratio), Math.ceil((box.w + 2) * ratio), Math.ceil(box.h * ratio));
+    });
+
+    const strip = document.createElement('canvas');
+    ops.forEach((op, index) => {
+      const before = reflowOffsetAt(ops.slice(0, index), (op.x0 + op.x1) / 2, op.cut);
+      const sy = Math.round((op.cut + before) * ratio);
+      const sx = clamp(Math.floor(op.x0 * ratio), 0, out.width);
+      const sw = clamp(Math.ceil(op.x1 * ratio), sx, out.width) - sx;
+      const dy = Math.round(op.push * ratio);
+      if (sw <= 0 || dy <= 0 || sy >= out.height) return;
+      const h = out.height - sy - dy;
+      if (h > 0) {
+        strip.width = sw;
+        strip.height = h;
+        strip.getContext('2d').drawImage(out, sx, sy, sw, h, 0, 0, sw, h);
+        ctx.drawImage(strip, sx, sy + dy);
+      }
+      // O vão aberto repete a linha de pixels do corte: bordas verticais e fundos de célula continuam.
+      strip.width = sw;
+      strip.height = 1;
+      strip.getContext('2d').drawImage(out, sx, sy, sw, 1, 0, 0, sw, 1);
+      ctx.drawImage(strip, 0, 0, sw, 1, sx, sy, sw, dy);
+    });
+    return out;
+  }
+
+  function presentPdfCanvas(paper, visible, current, ariaLabel) {
+    visible.className = 'pdf-canvas';
+    if (ariaLabel) visible.setAttribute('aria-label', ariaLabel);
+    const page = getPage(paper.dataset.pageId);
+    if (page) {
+      visible.style.width = `${page.width}px`;
+      visible.style.height = `${page.height}px`;
+    }
+    if (current === visible) return;
+    if (current) {
+      current.replaceWith(visible);
+      if (current !== sourceCanvases.get(paper)) {
+        current.width = 1;
+        current.height = 1;
+      }
+    } else {
+      paper.prepend(visible);
+    }
+  }
+
+  function applyReflowOffsetsToTextLayer(paper) {
+    const ops = paper._reflowOps || [];
+    $$('.text-layer span', paper).forEach(span => {
+      const top = Number(span.dataset.baseTop);
+      if (!Number.isFinite(top)) return;
+      const offset = ops.length ? reflowOffsetAt(ops, Number(span.dataset.baseLeft), Number(span.dataset.baseline)) : 0;
+      span.style.top = `${top + offset}px`;
+    });
+  }
+
+  function scheduleReflowCompose(page) {
+    if (reflowFrames.has(page.id)) return;
+    reflowFrames.set(page.id, requestAnimationFrame(() => {
+      reflowFrames.delete(page.id);
+      composeReflowNow(page);
+    }));
+  }
+
+  function composeReflowNow(page) {
+    const paper = $(`#paper-${CSS.escape(page.id)}`);
+    // Uma renderização em andamento já compõe a página ao terminar.
+    if (!paper || paper.dataset.rendered !== '1' || paper.dataset.rendering) return;
+    const current = $('.pdf-canvas', paper);
+    let source = sourceCanvases.get(paper);
+    if (!source) {
+      source = current;
+      sourceCanvases.set(paper, source);
+    }
+    presentPdfCanvas(paper, composeReflowCanvas(page, paper, source), current);
+    applyReflowOffsetsToTextLayer(paper);
+  }
+
+  // Move para baixo (ou de volta para cima) os elementos abaixo do corte de um parágrafo.
+  function shiftElementsBelow(page, element, delta) {
+    if (Math.abs(delta) < 0.25) return;
+    const flow = element.reflow;
+    const opsAbove = buildReflowOps(page).filter(op => op.cut < flow.cut - 0.5);
+    const cutOnScreen = flow.cut + reflowOffsetAt(opsAbove, (flow.x0 + flow.x1) / 2, flow.cut);
+    page.elements.forEach(other => {
+      if (other === element) return;
+      const centerX = other.x + other.w / 2;
+      if (other.y < cutOnScreen - 0.5 || centerX < flow.x0 || centerX > flow.x1) return;
+      other.y += delta;
+      const node = $(`.editor-element[data-element-id="${CSS.escape(other.id)}"]`);
+      if (node) applyElementGeometry(node, other);
+    });
+  }
+
+  function groupPush(page, flow) {
+    return (page.elements || []).reduce((max, element) => {
+      const other = element.reflow;
+      if (!other || Math.abs(other.cut - flow.cut) >= 1 || other.x0 >= flow.x1 || flow.x0 >= other.x1) return max;
+      return Math.max(max, other.pushed || 0);
+    }, 0);
+  }
+
+  function updateReflowElement(page, element, node) {
+    const flow = element.reflow;
+    if (!flow || pendingReflow.has(element.id) || !node.isConnected) return;
+    const height = node.offsetHeight;
+    if (!height) return;
+    element.h = height;
+    const push = Math.max(0, Math.round((height - flow.baseH - flow.free) * 100) / 100);
+    if (Math.abs(push - (flow.pushed || 0)) < 0.25) return;
+    const before = groupPush(page, flow);
+    flow.pushed = push;
+    shiftElementsBelow(page, element, groupPush(page, flow) - before);
+    scheduleReflowCompose(page);
+    scheduleSessionSave();
+  }
+
+  function observeReflowNode(node) {
+    reflowObserver ||= new ResizeObserver(entries => entries.forEach(entry => {
+      const target = entry.target;
+      const page = getPage(target.dataset.pageId);
+      const element = page?.elements?.find(item => item.id === target.dataset.elementId);
+      if (element?.reflow) updateReflowElement(page, element, target);
+    }));
+    reflowObserver.observe(node);
+  }
+
+  async function loadElementFonts(style) {
+    if (!document.fonts?.load) return;
+    const size = Math.max(1, Math.round(style.fontSize || 12));
+    const loads = ['normal 400', 'normal 700', 'italic 400', 'italic 700']
+      .map(variant => document.fonts.load(`${variant} ${size}px ${style.fontFamily}`).catch(() => null));
+    await Promise.race([Promise.all(loads), new Promise(resolve => setTimeout(resolve, 2500))]);
+  }
+
+  // Ajusta o espaçamento entre letras para a fonte substituta quebrar as linhas
+  // como o original (mesmo número de linhas).
+  function calibrateLetterSpacing(element, node, body, targetLines) {
+    const style = element.style;
+    const linePx = style.fontSize * style.lineHeight;
+    const lineCount = () => Math.round(node.offsetHeight / linePx);
+    const apply = value => {
+      style.letterSpacing = Math.abs(value) < 0.004 * style.fontSize ? 0 : Math.round(value * 1000) / 1000;
+      body.style.letterSpacing = `${style.letterSpacing}px`;
+      return lineCount();
+    };
+    const initial = apply(0);
+    if (initial === targetLines) return initial;
+    let low = initial > targetLines ? -0.08 * style.fontSize : 0;
+    let high = initial > targetLines ? 0 : 0.06 * style.fontSize;
+    for (let i = 0; i < 8; i++) {
+      const mid = (low + high) / 2;
+      const count = apply(mid);
+      if (count === targetLines) return count;
+      if (count > targetLines) high = mid;
+      else low = mid;
+    }
+    // Sem acerto exato: no mínimo não passa do número de linhas original (ou fica sem ajuste).
+    return apply(initial > targetLines ? low : 0);
+  }
+
+  async function convertPdfParagraphToOverlay(page, span, paper, event) {
+    const model = getTextModel(page);
+    const startSeg = model?.segOfItem.get(Number(span.dataset.itemIndex));
+    if (!startSeg) return convertPdfTextToOverlay(page, span, paper);
+    const para = detectParagraph(model, startSeg);
+    const items = para.lines.flatMap(line => line.items);
+    if (items.some(item => isTextItemConverted(page, item.index))) return convertPdfTextToOverlay(page, span, paper);
+
+    const source = sourceCanvases.get(paper) || $('.pdf-canvas', paper);
+    const ratio = source.width / page.width;
+    const box = { x: para.left, y: para.top, w: para.right - para.left, h: para.bottom - para.top };
+    const colors = sampleParagraphColors(source, ratio, box);
+    const cut = computeReflowCut(model, para, source, ratio, page);
+    const baseFont = dominantFont(para);
+    const fs = para.fs;
+    const justify = para.lines.length >= 2 && para.lines.slice(0, -1).every(line => para.colRight - line.right <= 0.6 * fs);
+
+    pushHistory();
+    const element = createTextElement(page, {
+      x: para.left,
+      y: para.top,
+      w: para.colRight - para.left + 1,
+      h: box.h,
+      html: paragraphHtml(para, baseFont),
+      fontSize: Math.round(fs * 100) / 100,
+      fontFamily: baseFont.css,
+      fontWeight: baseFont.bold ? '700' : '400',
+      fontStyle: baseFont.italic ? 'italic' : 'normal',
+      color: colors.text,
+      background: 'transparent',
+      lineHeight: Math.round((para.pitch / fs) * 1000) / 1000,
+      textAlign: justify ? 'justify' : 'left'
+    });
+    element.style.paddingLeft = Math.max(0, para.bodyLeft - para.left);
+    element.style.textIndent = para.firstLeft - para.bodyLeft;
+    element.reflow = {
+      items: items.map(item => item.index),
+      box,
+      lines: para.lines.length,
+      cut: cut.cut,
+      x0: cut.x0,
+      x1: cut.x1,
+      free: cut.free,
+      bg: colors.bg,
+      margin: clamp(model.minLeft, 30, 110),
+      baseH: box.h,
+      pushed: 0
+    };
+
+    pendingReflow.add(element.id);
+    page.elements.push(element);
+    const node = renderElement(page, element);
+    node.style.visibility = 'hidden';
+    $('.overlay-layer', paper).append(node);
+    try {
+      await loadElementFonts(element.style);
+      const body = $('.element-body', node);
+      const count = calibrateLetterSpacing(element, node, body, para.lines.length);
+      // Alinha a primeira linha de base da caixa com a do texto original.
+      const marker = document.createElement('span');
+      marker.style.cssText = 'display:inline-block;width:0;height:0;vertical-align:baseline';
+      body.prepend(marker);
+      const baselineOffset = marker.offsetTop;
+      marker.remove();
+      const firstBaseline = para.lines[0].baseline;
+      element.y = firstBaseline + reflowOffsetAt(buildReflowOps(page), para.left, firstBaseline) - baselineOffset;
+      applyElementGeometry(node, element);
+      element.h = node.offsetHeight;
+      element.reflow.baseH = count === para.lines.length ? element.h : para.lines.length * element.style.fontSize * element.style.lineHeight;
+    } finally {
+      pendingReflow.delete(element.id);
+      node.style.visibility = '';
+    }
+
+    items.forEach(item => $(`.text-layer span[data-item-index="${item.index}"]`, paper)?.classList.add('converted'));
+    updateReflowElement(page, element, node);
+    composeReflowNow(page);
+    selectElement(page.id, element.id, false);
+    const body = $('.element-body', node);
+    body.focus();
+    const range = event && document.caretRangeFromPoint?.(event.clientX, event.clientY);
+    if (range && body.contains(range.startContainer)) {
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    scheduleSessionSave();
+    showToast('Parágrafo editável: o restante da página se ajusta ao texto.');
   }
 
   function createThumbnailFromCanvas(page, sourceCanvas) {
@@ -798,6 +1600,10 @@
       if (element.type !== 'text') startElementDrag(event, page, element, node);
     });
     resizeHandle.addEventListener('pointerdown', event => startElementResize(event, page, element, node));
+    if (element.reflow) {
+      node.classList.add('flow');
+      observeReflowNode(node);
+    }
     return node;
   }
 
@@ -805,7 +1611,7 @@
     node.style.left = `${element.x}px`;
     node.style.top = `${element.y}px`;
     node.style.width = `${element.w}px`;
-    node.style.height = `${element.h}px`;
+    node.style.height = element.reflow ? 'auto' : `${element.h}px`;
     node.style.opacity = String(element.opacity ?? 1);
     node.style.zIndex = String(element.z ?? 1);
     node.style.transform = element.rotation ? `rotate(${element.rotation}deg)` : '';
@@ -822,6 +1628,9 @@
     body.style.color = style.color || '#111111';
     body.style.background = style.background ?? 'transparent';
     body.style.lineHeight = String(style.lineHeight || 1.2);
+    body.style.letterSpacing = style.letterSpacing ? `${style.letterSpacing}px` : '';
+    body.style.textIndent = style.textIndent ? `${style.textIndent}px` : '';
+    body.style.paddingLeft = style.paddingLeft ? `${style.paddingLeft}px` : '';
   }
 
   function createTextElement(page, overrides = {}) {
@@ -1045,7 +1854,7 @@
       op.element.y = clamp(op.y + dy, 0, op.page.height - op.element.h);
     } else {
       op.element.w = clamp(op.w + dx, 12, op.page.width - op.element.x);
-      op.element.h = clamp(op.h + dy, 12, op.page.height - op.element.y);
+      if (!op.element.reflow) op.element.h = clamp(op.h + dy, 12, op.page.height - op.element.y);
     }
     applyElementGeometry(op.node, op.element);
     updateSelectionInspector();
@@ -1063,12 +1872,21 @@
     if (!result) return;
     pushHistory();
     const { page, element } = result;
-    page.elements = page.elements.filter(item => item.id !== element.id);
-    if (element.sourceTextItem != null) {
-      const original = $(`#paper-${CSS.escape(page.id)} .text-layer span[data-item-index="${CSS.escape(String(element.sourceTextItem))}"]`);
-      original?.classList.remove('converted');
+    const node = $(`.editor-element[data-element-id="${CSS.escape(element.id)}"]`);
+    if (element.reflow) {
+      // O texto original volta e o conteúdo empurrado retorna ao lugar.
+      const before = groupPush(page, element.reflow);
+      element.reflow.pushed = 0;
+      shiftElementsBelow(page, element, groupPush(page, element.reflow) - before);
+      if (node) reflowObserver?.unobserve(node);
     }
-    $(`.editor-element[data-element-id="${CSS.escape(element.id)}"]`)?.remove();
+    page.elements = page.elements.filter(item => item.id !== element.id);
+    const restored = element.reflow ? element.reflow.items : element.sourceTextItem != null ? [element.sourceTextItem] : [];
+    restored.forEach(index => {
+      $(`#paper-${CSS.escape(page.id)} .text-layer span[data-item-index="${CSS.escape(String(index))}"]`)?.classList.remove('converted');
+    });
+    node?.remove();
+    if (element.reflow) composeReflowNow(page);
     clearSelection();
     scheduleSessionSave();
   }
@@ -1080,6 +1898,9 @@
     const { page, element } = result;
     const clone = deepClone(element);
     clone.id = uid(element.type);
+    // A cópia é uma caixa de texto comum: não cobre nem empurra o texto original.
+    delete clone.reflow;
+    delete clone.sourceTextItem;
     clone.x = clamp(clone.x + 14, 0, page.width - clone.w);
     clone.y = clamp(clone.y + 14, 0, page.height - clone.h);
     clone.z = state.nextZ++;
@@ -1110,7 +1931,7 @@
     element.x = clamp(Number($('#elementX').value || 0), 0, page.width - element.w);
     element.y = clamp(Number($('#elementY').value || 0), 0, page.height - element.h);
     element.w = clamp(Number($('#elementW').value || 12), 12, page.width - element.x);
-    element.h = clamp(Number($('#elementH').value || 12), 12, page.height - element.y);
+    if (!element.reflow) element.h = clamp(Number($('#elementH').value || 12), 12, page.height - element.y);
     const node = $(`.editor-element[data-element-id="${CSS.escape(element.id)}"]`);
     if (node) applyElementGeometry(node, element);
     positionFloatToolbar(node);
@@ -1405,6 +2226,7 @@
       canvas.removeAttribute('height');
     }
     if (textLayer) textLayer.innerHTML = '';
+    sourceCanvases.delete(paper);
     paper.dataset.rendered = '0';
   }
 
@@ -1510,7 +2332,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title}</title>
-<style>${snapshotCss()}</style>
+<style>${await snapshotFontCss()}${snapshotCss()}</style>
 </head>
 <body>
 <button class="print-button" onclick="window.print()">Imprimir / salvar PDF</button>
@@ -1552,8 +2374,12 @@
     const common = `left:${element.x}px;top:${element.y}px;width:${element.w}px;height:${element.h}px;opacity:${element.opacity ?? 1};z-index:${element.z || 1};${element.rotation ? `transform:rotate(${element.rotation}deg);` : ''}`;
     if (element.type === 'text') {
       const style = element.style || {};
-      const bodyStyle = `font-family:${style.fontFamily || 'Arial, sans-serif'};font-size:${style.fontSize || 12}px;font-weight:${style.fontWeight || 400};font-style:${style.fontStyle || 'normal'};text-decoration:${style.textDecoration || 'none'};text-align:${style.textAlign || 'left'};color:${style.color || '#111'};background:${style.background || 'transparent'};line-height:${style.lineHeight || 1.2}`;
-      return `<div class="snapshot-element snapshot-text" style="${common};${bodyStyle}">${sanitizeUserHtml(element.html || '')}</div>`;
+      const bodyStyle = `font-family:${(style.fontFamily || 'Arial, sans-serif').replace(/"/g, "'")};font-size:${style.fontSize || 12}px;font-weight:${style.fontWeight || 400};font-style:${style.fontStyle || 'normal'};text-decoration:${style.textDecoration || 'none'};text-align:${style.textAlign || 'left'};color:${style.color || '#111'};background:${style.background || 'transparent'};line-height:${style.lineHeight || 1.2}`
+        + (style.letterSpacing ? `;letter-spacing:${style.letterSpacing}px` : '')
+        + (style.textIndent ? `;text-indent:${style.textIndent}px` : '')
+        + (element.reflow ? `;padding-left:${style.paddingLeft || 0}px` : '');
+      const className = element.reflow ? 'snapshot-element snapshot-text snapshot-flow' : 'snapshot-element snapshot-text';
+      return `<div class="${className}" style="${common};${bodyStyle}">${sanitizeUserHtml(element.html || '')}</div>`;
     }
     if (element.type === 'image') {
       return `<img class="snapshot-element snapshot-image" style="${common}" src="${element.src}" alt="${escapeHtml(element.alt || '')}">`;
@@ -1561,9 +2387,32 @@
     return `<div class="snapshot-element" style="${common};background:${element.fill || '#fff'};border:${element.border || 'none'};border-radius:${element.radius || 0}px"></div>`;
   }
 
+  const BUNDLED_FONTS = [
+    ['DejaVu Sans', 400, 'normal', 'DejaVuSans'], ['DejaVu Sans', 700, 'normal', 'DejaVuSans-Bold'],
+    ['DejaVu Sans', 400, 'italic', 'DejaVuSans-Oblique'], ['DejaVu Sans', 700, 'italic', 'DejaVuSans-BoldOblique'],
+    ['DejaVu Serif', 400, 'normal', 'DejaVuSerif'], ['DejaVu Serif', 700, 'normal', 'DejaVuSerif-Bold'],
+    ['DejaVu Serif', 400, 'italic', 'DejaVuSerif-Italic'], ['DejaVu Serif', 700, 'italic', 'DejaVuSerif-BoldItalic']
+  ];
+
+  // O HTML exportado é um arquivo único: embute as fontes incluídas que os textos usam.
+  async function snapshotFontCss() {
+    const used = JSON.stringify(state.pages.map(page => (page.elements || []).filter(element => element.type === 'text')));
+    const faces = await Promise.all(BUNDLED_FONTS.filter(([family]) => used.includes(family)).map(async ([family, weight, style, file]) => {
+      try {
+        const response = await fetch(`vendor/fonts/${file}.woff2`);
+        if (!response.ok) return '';
+        const base64 = arrayBufferToBase64(await response.arrayBuffer());
+        return `@font-face{font-family:"${family}";src:url(data:font/woff2;base64,${base64}) format("woff2");font-weight:${weight};font-style:${style}}`;
+      } catch (error) {
+        return '';
+      }
+    }));
+    return faces.join('');
+  }
+
   function snapshotCss() {
     return `
-*{box-sizing:border-box}html,body{margin:0;background:#4a4d53;font-family:Arial,sans-serif}.print-button{position:fixed;z-index:9999;right:18px;top:18px;padding:10px 14px;border:0;border-radius:8px;background:#1f56d8;color:#fff;font:600 14px Arial;cursor:pointer;box-shadow:0 5px 18px #0005}.document{display:flex;flex-direction:column;align-items:center;gap:24px;padding:30px}.page{position:relative;flex:none;overflow:hidden;background:#fff;box-shadow:0 9px 30px #0006}.page-background{position:absolute;inset:0;width:100%;height:100%;object-fit:fill}.searchable-text{position:absolute;inset:0;overflow:hidden;line-height:1}.searchable-text span{position:absolute;transform-origin:0 0;white-space:pre;color:transparent;user-select:text}.flow-content{position:absolute;overflow:hidden;font:16px Arial,sans-serif;color:#111}.flow-content p{margin:0 0 .72em}.flow-content h1{margin:0 0 .6em;font-size:2em;line-height:1.15}.flow-content h2{margin:0 0 .6em;font-size:1.5em;line-height:1.2}.flow-content h3{margin:0 0 .6em;font-size:1.2em;line-height:1.25}.overlays{position:absolute;inset:0;overflow:hidden}.snapshot-element{position:absolute;transform-origin:center}.snapshot-text{padding:2px 3px;overflow:hidden;white-space:pre-wrap;word-break:break-word}.snapshot-image{object-fit:contain}@media print{@page{margin:0}html,body{background:#fff}.print-button{display:none}.document{display:block;padding:0}.page{box-shadow:none;break-after:page;page-break-after:always;margin:0}}
+*{box-sizing:border-box}html,body{margin:0;background:#4a4d53;font-family:Arial,sans-serif}.print-button{position:fixed;z-index:9999;right:18px;top:18px;padding:10px 14px;border:0;border-radius:8px;background:#1f56d8;color:#fff;font:600 14px Arial;cursor:pointer;box-shadow:0 5px 18px #0005}.document{display:flex;flex-direction:column;align-items:center;gap:24px;padding:30px}.page{position:relative;flex:none;overflow:hidden;background:#fff;box-shadow:0 9px 30px #0006}.page-background{position:absolute;inset:0;width:100%;height:100%;object-fit:fill}.searchable-text{position:absolute;inset:0;overflow:hidden;line-height:1}.searchable-text span{position:absolute;transform-origin:0 0;white-space:pre;color:transparent;user-select:text}.flow-content{position:absolute;overflow:hidden;font:16px Arial,sans-serif;color:#111}.flow-content p{margin:0 0 .72em}.flow-content h1{margin:0 0 .6em;font-size:2em;line-height:1.15}.flow-content h2{margin:0 0 .6em;font-size:1.5em;line-height:1.2}.flow-content h3{margin:0 0 .6em;font-size:1.2em;line-height:1.25}.overlays{position:absolute;inset:0;overflow:hidden}.snapshot-element{position:absolute;transform-origin:center}.snapshot-text{padding:2px 3px;overflow:hidden;white-space:pre-wrap;word-break:break-word}.snapshot-text.snapshot-flow{padding-top:0;padding-right:0;padding-bottom:0;overflow:visible;white-space:normal;word-break:normal;overflow-wrap:break-word}.snapshot-image{object-fit:contain}@media print{@page{margin:0}html,body{background:#fff}.print-button{display:none}.document{display:block;padding:0}.page{box-shadow:none;break-after:page;page-break-after:always;margin:0}}
 `;
   }
 

@@ -67,9 +67,16 @@ Por isso, este editor usa uma abordagem visual:
 
 1. o PDF original é renderizado como base da página;
 2. o texto extraído forma uma camada selecionável;
-3. ao dar duplo clique em um trecho, o editor cria uma caixa de texto sobre o conteúdo original;
-4. a caixa recebe inicialmente um fundo branco, mascarando o trecho anterior;
-5. o usuário pode alterar o texto, fonte, cor, fundo, posição e tamanho.
+3. ao dar duplo clique em um trecho, o editor identifica o **parágrafo inteiro** (linhas com o mesmo alinhamento e espaçamento, inclusive dentro de células de tabela) e o transforma numa caixa editável com a mesma largura de coluna, fonte, tamanho, cor, negrito/itálico, recuo e justificação;
+4. o texto original do parágrafo é apagado da imagem da página e substituído pela caixa;
+5. ao editar, o texto quebra as linhas sozinho. Se o parágrafo crescer, **tudo o que vem abaixo dele desce junto**: parágrafos, tabelas (a linha da tabela cresce e as bordas acompanham) e elementos inseridos. Se ele diminuir, o conteúdo sobe de volta até a posição original.
+
+Detalhes do ajuste de linhas:
+
+- dentro de uma tabela, o parágrafo usa primeiro o espaço livre que já existe na célula antes de empurrar a tabela;
+- em páginas com colunas lado a lado, só a coluna editada desce;
+- se o conteúdo empurrado passar da margem inferior, a página é alongada para não cortar nada (o conteúdo não passa automaticamente para a página seguinte);
+- PDFs feitos com as fontes DejaVu usam as cópias incluídas em `vendor/fonts`; para outras fontes, o editor usa a fonte equivalente do sistema e ajusta o espaçamento para manter as mesmas quebras de linha.
 
 Essa abordagem preserva o visual do PDF e funciona inclusive quando a estrutura interna do arquivo é irregular. Ela não reescreve os objetos internos do PDF original.
 
@@ -133,6 +140,7 @@ natural_pdf_editor/
     ├── jszip.min.js
     ├── cmaps/
     ├── standard_fonts/
+    ├── fonts/          (DejaVu Sans/Serif em WOFF2, para casar com PDFs que usam essas fontes)
     └── licenses/
 ```
 

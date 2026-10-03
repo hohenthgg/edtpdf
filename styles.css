@@ -58,13 +58,16 @@ button:disabled { cursor: not-allowed; opacity: .38; }
   height: var(--topbar-h);
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 8px 14px;
+  gap: 8px;
+  padding: 8px 12px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
+  /* Rede de segurança: se ainda faltar espaço, a barra rola em vez de esconder botões. */
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 .brand {
-  min-width: 212px;
+  flex: none;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -83,11 +86,11 @@ button:disabled { cursor: not-allowed; opacity: .38; }
   font-size: 18px;
 }
 .brand strong { display: block; font-size: 13.5px; letter-spacing: .01em; }
-.brand small { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; max-width: 168px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.brand small { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; max-width: 130px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.toolbar { display: flex; align-items: center; gap: 6px; }
+.toolbar { display: flex; flex: none; align-items: center; gap: 4px; }
 .toolbar-right { margin-left: auto; }
-.divider { width: 1px; height: 22px; background: var(--line-strong); margin: 0 4px; }
+.divider { width: 1px; height: 22px; background: var(--line-strong); margin: 0 2px; }
 
 /* ── Controles ──────────────────────────────────────────────── */
 button, select, input[type="number"], input[type="text"] {
@@ -114,6 +117,8 @@ button.text-btn:hover:not(:disabled) { color: var(--text); background: transpare
 .icon-btn { min-width: 32px; padding-inline: 8px; }
 .mode-btn.active { background: var(--accent-soft); border-color: rgba(79, 184, 168, .45); color: #a9e2d8; }
 .large { min-height: 42px; padding: 10px 20px; font-weight: 600; }
+.topbar .tool-btn { padding-inline: 8px; }
+.topbar .icon-btn { min-width: 30px; padding-inline: 6px; }
 
 select, input[type="number"], input[type="text"] {
   min-height: 32px;
@@ -122,10 +127,10 @@ select, input[type="number"], input[type="text"] {
   background: var(--panel-2);
 }
 select:focus, input:focus { border-color: var(--accent); }
-.toolbar-format select { max-width: 130px; }
-.font-size { width: 56px; }
+.toolbar-format select { max-width: 108px; }
+.font-size { width: 50px; }
 input[type="color"] {
-  width: 32px;
+  width: 30px;
   height: 32px;
   padding: 3px;
   background: var(--panel-2);
@@ -133,7 +138,7 @@ input[type="color"] {
   border-radius: var(--radius);
   cursor: pointer;
 }
-.zoom-label { min-width: 44px; text-align: center; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.zoom-label { min-width: 38px; text-align: center; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 
 /* ── Painéis laterais ───────────────────────────────────────── */
 .left-panel, .right-panel {
@@ -520,7 +525,7 @@ body.export-mode .drag-handle, body.export-mode .resize-handle, body.export-mode
 }
 
 /* ── Responsividade ─────────────────────────────────────────── */
-@media (max-width: 1320px) {
+@media (max-width: 1359px) {
   .toolbar-format { display: none; }
   .brand { min-width: 176px; }
   :root { --right-w: 226px; }

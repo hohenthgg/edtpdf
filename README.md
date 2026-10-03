@@ -51,21 +51,11 @@ Depois abra `http://localhost:4173`.
 
 ## Publicação no GitHub Pages
 
-O projeto é totalmente estático e já vem pronto para o GitHub Pages.
+O projeto é totalmente estático e já vem pronto para o GitHub Pages, publicado direto da branch:
 
-### Opção A — automática (recomendada)
-
-O repositório inclui o workflow `.github/workflows/deploy.yml`, que publica o site a cada push na branch `main`.
-
-1. Crie um repositório no GitHub e envie **o conteúdo desta pasta para a raiz** do repositório (o `index.html` deve ficar na raiz, não dentro de uma subpasta).
-2. No repositório, abra **Settings → Pages** e, em **Build and deployment → Source**, escolha **GitHub Actions**.
-3. Faça um push na branch `main` (ou rode o workflow manualmente em **Actions → Publicar no GitHub Pages → Run workflow**).
-4. O site ficará disponível em `https://SEU-USUARIO.github.io/NOME-DO-REPOSITORIO/`.
-
-### Opção B — direto da branch
-
-1. Envie os arquivos para a raiz da branch `main`.
-2. Em **Settings → Pages → Source**, escolha **Deploy from a branch**, branch `main`, pasta `/ (root)`.
+1. Envie **o conteúdo desta pasta para a raiz** da branch `main` (o `index.html` deve ficar na raiz, não dentro de uma subpasta).
+2. Em **Settings → Pages → Build and deployment → Source**, escolha **Deploy from a branch**, branch `main`, pasta `/ (root)`.
+3. A cada push na `main`, o GitHub publica o site em `https://SEU-USUARIO.github.io/NOME-DO-REPOSITORIO/`.
 
 Todos os caminhos do projeto são relativos, então ele funciona tanto em `usuario.github.io` quanto em `usuario.github.io/repositorio/` sem nenhum ajuste. O arquivo `.nojekyll` incluído impede que o GitHub processe o site com Jekyll.
 
@@ -133,7 +123,6 @@ natural_pdf_editor/
 ├── styles.css
 ├── app.js
 ├── .nojekyll
-├── .github/workflows/deploy.yml
 ├── iniciar-windows.bat
 ├── iniciar.sh
 └── vendor/

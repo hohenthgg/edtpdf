@@ -972,7 +972,20 @@
       const dy = Math.abs(other.baseline - seg.baseline);
       if (other !== seg && sameTextSize(other.fs, seg.fs) && Math.abs(other.left - seg.left) <= 0.6 * seg.fs && dy >= 0.9 * seg.fs && dy <= 2 * seg.fs) best = Math.min(best, dy);
     });
-    return Number.isFinite(best) ? best : seg.fs * 1.2;
+    return Number.isFinite(best) ? best : seg.fs * pageLineRatio(model);
+  }
+
+  // Espaçamento típico da página (entrelinha ÷ tamanho da fonte), para linhas isoladas.
+  function pageLineRatio(model) {
+    if (model.lineRatio) return model.lineRatio;
+    const ratios = [];
+    model.segments.forEach(seg => model.segments.forEach(other => {
+      const dy = other.baseline - seg.baseline;
+      if (sameTextSize(other.fs, seg.fs) && Math.abs(other.left - seg.left) <= 0.6 * seg.fs && dy >= 0.9 * seg.fs && dy <= 2 * seg.fs) ratios.push(dy / seg.fs);
+    }));
+    ratios.sort((a, b) => a - b);
+    model.lineRatio = ratios.length ? clamp(ratios[Math.floor(ratios.length / 2)], 1, 2) : 1.2;
+    return model.lineRatio;
   }
 
   function paragraphHtml(para, baseFont) {

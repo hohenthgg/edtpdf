@@ -71,7 +71,7 @@
   const sourceCanvases = new WeakMap(); // .paper → desenho original do PDF.js, antes do reflow
   const reflowFrames = new Map();
   const pendingReflow = new Set(); // elementos ainda sendo medidos na conversão
-  const grownPagesWarned = new Set();
+  const continuationWarned = new Set();
   let reflowObserver = null;
 
   if (window.pdfjsLib) {
@@ -372,7 +372,7 @@
     paper.style.height = `${page.height}px`;
     paper.style.transform = `scale(${state.zoom})`;
 
-    if (page.type === 'pdf') {
+    if (page.type === 'pdf' || page.type === 'continuation') {
       const canvas = document.createElement('canvas');
       canvas.className = 'pdf-canvas';
       canvas.setAttribute('aria-label', `Página ${index + 1} do PDF`);
@@ -480,8 +480,7 @@
 
     const meta = document.createElement('span');
     meta.className = 'thumb-meta';
-    const label = page.type === 'pdf' ? `PDF • original ${page.sourcePageNumber}` : 'Página A4 editável';
-    meta.innerHTML = `<strong>Página ${index + 1}</strong><small>${escapeHtml(label)}</small>`;
+    meta.innerHTML = `<strong>Página ${index + 1}</strong><small>${escapeHtml(pageLabel(page))}</small>`;
     button.append(preview, meta);
     button.addEventListener('click', () => scrollToPage(page.id));
     return button;
@@ -494,6 +493,7 @@
         const pageId = entry.target.dataset.pageId;
         const page = getPage(pageId);
         if (page?.type === 'pdf') ensurePdfPageRendered(pageId).catch(error => console.error(error));
+        if (page?.type === 'continuation') ensurePdfPageRendered(page.parentId).catch(error => console.error(error));
       });
     }, { root: dom.workspace, rootMargin: '1300px 0px', threshold: 0.01 });
 
@@ -566,6 +566,12 @@
         const transform = outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
 
         await sourcePage.render({ canvasContext: context, viewport, transform, background: 'rgb(255,255,255)' }).promise;
+        // O modelo de texto vem antes da composição: o corte para a continuação e o rodapé dependem dele.
+        const textContent = firstRender || !getTextModel(pageState) ? await sourcePage.getTextContent() : null;
+        if (textContent && !getTextModel(pageState)) {
+          if (!textModels.has(pdfDocument)) textModels.set(pdfDocument, new Map());
+          textModels.get(pdfDocument).set(pageState.sourcePageNumber, buildTextModel(viewport, textContent, sourcePage));
+        }
         // Com parágrafos reformatados, a tela mostra uma composição; o desenho do PDF.js fica guardado como fonte.
         let visible = canvas;
         if (pageHasReflow(pageState)) {
@@ -578,12 +584,12 @@
         presentPdfCanvas(paper, visible, oldCanvas, canvas.getAttribute('aria-label'));
         paper.dataset.pixelRatio = String(outputScale);
         if (firstRender) {
-          const textContent = await sourcePage.getTextContent();
-          renderTextLayer(pageState, paper, viewport, textContent, sourcePage);
+          renderTextLayer(pageState, paper, viewport, textContent);
           createThumbnailFromCanvas(pageState, canvas);
         }
         applyReflowOffsetsToTextLayer(paper);
         paper.dataset.rendered = '1';
+        if (pageHasReflow(pageState) || continuationOf(pageState)) layoutContinuation(pageState, paper);
       } finally {
         delete paper.dataset.rendering;
         renderPromises.delete(pageId);
@@ -615,12 +621,10 @@
     }
   }
 
-  function renderTextLayer(pageState, paper, viewport, textContent, sourcePage) {
+  function renderTextLayer(pageState, paper, viewport, textContent) {
     const layer = $('.text-layer', paper);
     layer.innerHTML = '';
     const styles = textContent.styles || {};
-    if (!textModels.has(pdfDocument)) textModels.set(pdfDocument, new Map());
-    textModels.get(pdfDocument).set(pageState.sourcePageNumber, buildTextModel(viewport, textContent, sourcePage));
 
     textContent.items.forEach((item, itemIndex) => {
       if (!item.str) return;
@@ -1175,67 +1179,143 @@
     return ops.reduce((sum, op) => (op.cut <= y && x >= op.x0 && x <= op.x1 ? sum + op.push : sum), 0);
   }
 
-  function lastContentRow(source, ratio) {
-    if (source._lastContentRow != null) return source._lastContentRow;
+  // Última linha com tinta acima de y (em px CSS da página original).
+  function lastContentRowAbove(source, ratio, limitY) {
+    source._lastRows ||= new Map();
+    const key = Math.round(limitY);
+    if (source._lastRows.has(key)) return source._lastRows.get(key);
     let last = 0;
     try {
-      const { width, height } = source;
-      const data = source.getContext('2d').getImageData(0, 0, width, height).data;
-      outer: for (let y = height - 1; y >= 0; y--) {
+      const width = source.width;
+      const rows = clamp(Math.floor(limitY * ratio), 1, source.height);
+      const data = source.getContext('2d').getImageData(0, 0, width, rows).data;
+      outer: for (let y = rows - 1; y >= 0; y--) {
         for (let x = 0; x < width; x++) {
           const i = (y * width + x) * 4;
-          if (data[i] < 235 || data[i + 1] < 235 || data[i + 2] < 235) { last = y; break outer; }
+          if (data[i] < 235 || data[i + 1] < 235 || data[i + 2] < 235) { last = y + 1; break outer; }
         }
       }
     } catch (error) {
-      last = source.height;
+      last = limitY * ratio;
     }
-    source._lastContentRow = last / ratio;
-    return source._lastContentRow;
+    source._lastRows.set(key, last / ratio);
+    return last / ratio;
+  }
+
+  // Cabeçalho e rodapé (texto dentro das margens) ficam fixos na página; o
+  // limite é até onde o conteúdo pode ir antes de passar para a continuação.
+  function pageGeometry(page, source, ratio) {
+    const model = getTextModel(page);
+    const base = pageBaseHeight(page);
+    const margin = clamp(model?.minLeft ?? 72, 30, 110);
+    const segments = model?.segments || [];
+    const footer = segments.filter(seg => seg.top >= base - margin);
+    const header = segments.filter(seg => seg.bottom <= margin * 0.9);
+    const body = segments.filter(seg => !footer.includes(seg) && !header.includes(seg));
+    const footerTop = footer.length ? Math.min(...footer.map(seg => seg.top)) - 3 : base;
+    const contentTop = body.length ? Math.min(...body.map(seg => seg.top)) : margin;
+    const lastContent = lastContentRowAbove(source, ratio, footerTop);
+    const limit = Math.min(Math.max(base - margin, lastContent), footerTop - 6);
+    return { base, margin, footerTop, contentTop, lastContent, limit, fixed: new Set([...footer, ...header]) };
+  }
+
+  function flowBodyHeight(element) {
+    const body = $(`.editor-element[data-element-id="${CSS.escape(element.id)}"] .element-body`);
+    return body?.offsetHeight || element.h;
+  }
+
+  // Onde cortar a página para mandar o excesso à continuação: sem partir caixas,
+  // entre duas linhas do parágrafo editado e fora das linhas de texto do PDF.
+  function computeContinuationSplit(page, ops, geo) {
+    const model = getTextModel(page);
+    const converted = new Set((page.elements || []).flatMap(element => element.reflow?.items || []));
+    const lines = (model?.segments || [])
+      .filter(seg => !geo.fixed.has(seg) && !seg.items.some(item => converted.has(item.index)))
+      .map(seg => {
+        const offset = reflowOffsetAt(ops, seg.left, seg.baseline);
+        return { seg, top: seg.top + offset, bottom: seg.bottom + offset };
+      });
+    let split = geo.limit;
+    for (let i = 0; i < 8; i++) {
+      const before = split;
+      (page.elements || []).forEach(element => {
+        const height = element.reflow ? flowBodyHeight(element) : element.h;
+        if (element.y >= split || element.y + height <= split + 0.5) return;
+        if (element.reflow) {
+          const linePx = element.style.fontSize * element.style.lineHeight;
+          split = element.y + Math.floor((split - element.y) / linePx + 1e-6) * linePx;
+        } else if (element.y > geo.contentTop) {
+          split = element.y;
+        }
+      });
+      lines.forEach(line => {
+        if (line.top < split && line.bottom > split) split = line.top - 0.5;
+      });
+      if (Math.abs(split - before) < 0.01) break;
+    }
+    // Um título não fica sozinho no fim da página: vai junto com o conteúdo para a continuação.
+    const above = lines.filter(line => line.bottom <= split).sort((a, b) => b.bottom - a.bottom);
+    const last = above[0];
+    if (last && lines.some(line => line.top >= split) && isHeadingLine(last.seg, model) && (!above[1] || last.top - above[1].bottom > 0.6 * last.seg.fs)) {
+      split = last.top - 0.5;
+    }
+    return Math.max(split, geo.contentTop + 1);
+  }
+
+  // Linha de título: fonte maior que o corpo do texto, ou toda em negrito e curta.
+  function isHeadingLine(seg, model) {
+    if (!model.bodyFs) {
+      const sizes = new Map();
+      model.segments.forEach(item => {
+        const key = Math.round(item.fs * 10) / 10;
+        sizes.set(key, (sizes.get(key) || 0) + item.items.reduce((sum, part) => sum + part.str.length, 0));
+      });
+      model.bodyFs = [...sizes.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] || seg.fs;
+    }
+    const solid = seg.items.filter(item => !item.blank);
+    const allBold = solid.length > 0 && solid.every(item => item.font.bold);
+    const text = solid.map(item => item.str).join('').trim();
+    return seg.fs >= model.bodyFs * 1.08 || (allBold && text.length <= 80 && !/[.;:,]$/.test(text));
   }
 
   function setPdfPageHeight(page, paper, height) {
     if (Math.abs(page.height - height) < 0.5) return;
-    const grewNow = height > pageBaseHeight(page) + 0.5 && page.height <= pageBaseHeight(page) + 0.5;
     page.height = height;
     paper.style.height = `${height}px`;
     const shell = paper.closest('.page-shell');
     if (shell) shell.style.height = `${height * state.zoom}px`;
-    if (grewNow && !grownPagesWarned.has(page.id)) {
-      grownPagesWarned.add(page.id);
-      const index = state.pages.indexOf(page) + 1;
-      showToast(`A página ${index} foi alongada para não cortar o conteúdo empurrado pelo texto.`, 4200);
-    }
     scheduleSessionSave();
   }
 
+  // Monta a página em altura "virtual" (com tudo o que foi empurrado) e a divide:
+  // a página mantém o tamanho original e o excesso vai para a continuação.
   function composeReflowCanvas(page, paper, source) {
     const flows = (page.elements || []).filter(element => element.reflow);
     const ratio = source.width / page.width;
     const ops = buildReflowOps(page);
     paper._reflowOps = ops;
-
-    // A página só cresce se o conteúdo empurrado (ou o próprio texto editado)
-    // passar da margem inferior; o espaço em branco do rodapé é usado antes.
-    const baseHeight = pageBaseHeight(page);
-    let height = baseHeight;
-    if (flows.length) {
-      const last = lastContentRow(source, ratio);
-      const margin = Math.max(...flows.map(element => element.reflow.margin || 48));
-      const limit = Math.max(baseHeight - margin, last);
-      const shift = Math.max(0, ...ops.map(op => reflowOffsetAt(ops, (op.x0 + op.x1) / 2, last)));
-      const textBottom = Math.max(...flows.map(element => element.y + element.h));
-      height = baseHeight + Math.max(0, Math.ceil(Math.max(last + shift, textBottom) - limit));
+    paper._split = null;
+    const base = pageBaseHeight(page);
+    setPdfPageHeight(page, paper, base);
+    if (!flows.length) {
+      paper._geo = null;
+      return source;
     }
-    setPdfPageHeight(page, paper, height);
-    if (!flows.length) return source;
 
-    const out = document.createElement('canvas');
-    out.width = source.width;
-    out.height = Math.round(height * ratio);
-    const ctx = out.getContext('2d', { alpha: false });
+    const geo = pageGeometry(page, source, ratio);
+    paper._geo = geo;
+    const shift = Math.max(0, ...ops.map(op => reflowOffsetAt(ops, (op.x0 + op.x1) / 2, geo.lastContent)));
+    const elementsBottom = Math.max(0, ...page.elements.map(element => element.y + (element.reflow ? flowBodyHeight(element) : element.h)));
+    const virtualBottom = Math.max(geo.lastContent + shift, elementsBottom);
+    const W = source.width;
+    const virtualPx = Math.ceil(Math.max(base, virtualBottom + 4) * ratio);
+
+    const virtual = document.createElement('canvas');
+    virtual.width = W;
+    virtual.height = virtualPx;
+    const ctx = virtual.getContext('2d', { alpha: false });
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, out.width, out.height);
+    ctx.fillRect(0, 0, W, virtualPx);
     ctx.drawImage(source, 0, 0);
     // Apaga o texto original dos parágrafos convertidos (a caixa editável o substitui).
     flows.forEach(element => {
@@ -1243,28 +1323,67 @@
       ctx.fillStyle = element.reflow.bg || '#ffffff';
       ctx.fillRect(Math.floor((box.x - 1) * ratio), Math.floor(box.y * ratio), Math.ceil((box.w + 2) * ratio), Math.ceil(box.h * ratio));
     });
+    // O rodapé sai da área que se desloca e volta depois no lugar original.
+    const footerY = Math.round(geo.footerTop * ratio);
+    const footerH = Math.round(base * ratio) - footerY;
+    let footer = null;
+    if (footerH > 0 && geo.footerTop < base) {
+      footer = document.createElement('canvas');
+      footer.width = W;
+      footer.height = footerH;
+      footer.getContext('2d').drawImage(source, 0, footerY, W, footerH, 0, 0, W, footerH);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, footerY, W, footerH);
+    }
 
     const strip = document.createElement('canvas');
     ops.forEach((op, index) => {
       const before = reflowOffsetAt(ops.slice(0, index), (op.x0 + op.x1) / 2, op.cut);
       const sy = Math.round((op.cut + before) * ratio);
-      const sx = clamp(Math.floor(op.x0 * ratio), 0, out.width);
-      const sw = clamp(Math.ceil(op.x1 * ratio), sx, out.width) - sx;
+      const sx = clamp(Math.floor(op.x0 * ratio), 0, W);
+      const sw = clamp(Math.ceil(op.x1 * ratio), sx, W) - sx;
       const dy = Math.round(op.push * ratio);
-      if (sw <= 0 || dy <= 0 || sy >= out.height) return;
-      const h = out.height - sy - dy;
+      if (sw <= 0 || dy <= 0 || sy >= virtualPx) return;
+      const h = virtualPx - sy - dy;
       if (h > 0) {
         strip.width = sw;
         strip.height = h;
-        strip.getContext('2d').drawImage(out, sx, sy, sw, h, 0, 0, sw, h);
+        strip.getContext('2d').drawImage(virtual, sx, sy, sw, h, 0, 0, sw, h);
         ctx.drawImage(strip, sx, sy + dy);
       }
       // O vão aberto repete a linha de pixels do corte: bordas verticais e fundos de célula continuam.
       strip.width = sw;
       strip.height = 1;
-      strip.getContext('2d').drawImage(out, sx, sy, sw, 1, 0, 0, sw, 1);
+      strip.getContext('2d').drawImage(virtual, sx, sy, sw, 1, 0, 0, sw, 1);
       ctx.drawImage(strip, 0, 0, sw, 1, sx, sy, sw, dy);
     });
+
+    const split = virtualBottom > geo.limit + 0.5 ? computeContinuationSplit(page, ops, geo) : null;
+    const out = document.createElement('canvas');
+    out.width = W;
+    out.height = Math.round(base * ratio);
+    const outCtx = out.getContext('2d', { alpha: false });
+    outCtx.fillStyle = '#ffffff';
+    outCtx.fillRect(0, 0, W, out.height);
+    const keepPx = Math.round((split ?? base) * ratio);
+    outCtx.drawImage(virtual, 0, 0, W, keepPx, 0, 0, W, keepPx);
+    if (footer) outCtx.drawImage(footer, 0, footerY);
+
+    if (split != null) {
+      // A continuação começa na mesma margem superior do conteúdo da página.
+      const topC = geo.contentTop;
+      const height = Math.max(base, topC + (virtualBottom - split) + (base - geo.limit));
+      const cont = document.createElement('canvas');
+      cont.width = W;
+      cont.height = Math.round(height * ratio);
+      const contCtx = cont.getContext('2d', { alpha: false });
+      contCtx.fillStyle = '#ffffff';
+      contCtx.fillRect(0, 0, W, cont.height);
+      const fromPx = Math.round(split * ratio);
+      const lengthPx = Math.max(1, virtualPx - fromPx);
+      contCtx.drawImage(virtual, 0, fromPx, W, lengthPx, 0, Math.round(topC * ratio), W, lengthPx);
+      paper._split = { S: split, topC, height, canvas: cont };
+    }
     return out;
   }
 
@@ -1293,7 +1412,9 @@
     $$('.text-layer span', paper).forEach(span => {
       const top = Number(span.dataset.baseTop);
       if (!Number.isFinite(top)) return;
-      const offset = ops.length ? reflowOffsetAt(ops, Number(span.dataset.baseLeft), Number(span.dataset.baseline)) : 0;
+      // O rodapé fica fixo; o resto acompanha os deslocamentos.
+      const fixed = paper._geo && top >= paper._geo.footerTop;
+      const offset = ops.length && !fixed ? reflowOffsetAt(ops, Number(span.dataset.baseLeft), Number(span.dataset.baseline)) : 0;
       span.style.top = `${top + offset}px`;
     });
   }
@@ -1318,6 +1439,271 @@
     }
     presentPdfCanvas(paper, composeReflowCanvas(page, paper, source), current);
     applyReflowOffsetsToTextLayer(paper);
+    layoutContinuation(page, paper);
+  }
+
+  /* ── Página de continuação ───────────────────────────────────
+   * Quando o conteúdo passa do fim da folha, o excesso aparece numa página de
+   * continuação logo depois (type: 'continuation'). Os dados continuam na página
+   * de origem: a continuação mostra a parte de baixo da imagem "virtual" e os
+   * elementos abaixo do corte. O parágrafo que atravessa o corte aparece nas
+   * duas páginas, como duas vistas editáveis do mesmo texto.
+   */
+
+  function continuationOf(page) {
+    return state.pages.find(item => item.type === 'continuation' && item.parentId === page.id) || null;
+  }
+
+  function addContinuationPage(parent) {
+    const cont = {
+      id: uid('page'), type: 'continuation', parentId: parent.id,
+      width: parent.width, height: pageBaseHeight(parent), elements: [], thumb: null
+    };
+    const index = state.pages.indexOf(parent) + 1;
+    state.pages.splice(index, 0, cont);
+    const shell = createPageShell(cont, index);
+    $(`#shell-${CSS.escape(parent.id)}`)?.after(shell);
+    $(`.page-thumb[data-page-id="${CSS.escape(parent.id)}"]`)?.after(createPageThumb(cont, index));
+    pageRenderObserver?.observe(shell);
+    currentPageObserver?.observe(shell);
+    refreshPageLabels();
+    if (!continuationWarned.has(parent.id)) {
+      continuationWarned.add(parent.id);
+      showToast(`O texto passou do fim da página ${index}: o restante foi para uma página de continuação.`, 4200);
+    }
+    scheduleSessionSave();
+    return cont;
+  }
+
+  function removeContinuationPage(cont) {
+    state.pages = state.pages.filter(item => item !== cont);
+    $(`#shell-${CSS.escape(cont.id)}`)?.remove();
+    $(`.page-thumb[data-page-id="${CSS.escape(cont.id)}"]`)?.remove();
+    if (state.currentPageId === cont.id) setCurrentPage(cont.parentId, false);
+    refreshPageLabels();
+    scheduleSessionSave();
+  }
+
+  function pageLabel(page) {
+    if (page.type === 'continuation') return `Continuação da página ${state.pages.findIndex(item => item.id === page.parentId) + 1}`;
+    return page.type === 'pdf' ? `PDF • original ${page.sourcePageNumber}` : 'Página A4 editável';
+  }
+
+  function refreshPageLabels() {
+    state.pages.forEach((page, index) => {
+      const tag = $(`#shell-${CSS.escape(page.id)} .page-number-tag`);
+      if (tag) tag.textContent = `Página ${index + 1}`;
+      const meta = $(`.page-thumb[data-page-id="${CSS.escape(page.id)}"] .thumb-meta`);
+      if (meta) meta.innerHTML = `<strong>Página ${index + 1}</strong><small>${escapeHtml(pageLabel(page))}</small>`;
+    });
+    dom.pageCountLabel.textContent = String(state.pages.length);
+    updatePageSettingsUI();
+  }
+
+  function layoutContinuation(page, paper) {
+    const split = paper._split;
+    let cont = continuationOf(page);
+    if (!split) {
+      routeElementsToPages(page, paper, null, null);
+      $$('.text-layer span.moved', paper).forEach(span => span.classList.remove('moved'));
+      if (cont && !cont.elements.length) removeContinuationPage(cont);
+      else if (cont) {
+        const cPaper = $(`#paper-${CSS.escape(cont.id)}`);
+        if (cPaper) $('.text-layer', cPaper).innerHTML = '';
+      }
+      return;
+    }
+    cont ||= addContinuationPage(page);
+    const cPaper = $(`#paper-${CSS.escape(cont.id)}`);
+    if (!cPaper) return;
+    setPdfPageHeight(cont, cPaper, split.height);
+    presentPdfCanvas(cPaper, split.canvas, $('.pdf-canvas', cPaper));
+    cloneTextLayerToContinuation(page, paper, cPaper, split);
+    routeElementsToPages(page, paper, cPaper, split);
+    createThumbnailFromCanvas(cont, split.canvas);
+  }
+
+  function cloneTextLayerToContinuation(page, paper, cPaper, split) {
+    const layer = $('.text-layer', cPaper);
+    layer.innerHTML = '';
+    $$('.text-layer span', paper).forEach(span => {
+      const top = parseFloat(span.style.top);
+      const moved = top >= split.S - 0.5 && !(paper._geo && Number(span.dataset.baseTop) >= paper._geo.footerTop);
+      span.classList.toggle('moved', moved);
+      if (!moved) return;
+      const clone = span.cloneNode(true);
+      clone.classList.remove('moved');
+      clone.style.top = `${top - split.S + split.topC}px`;
+      clone.addEventListener('dblclick', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (state.mode !== 'edit' || span.classList.contains('converted')) return;
+        convertPdfParagraphToOverlay(page, span, paper, event).catch(error => console.error(error));
+      });
+      layer.append(clone);
+    });
+  }
+
+  // Coloca cada elemento da página de origem na página certa (origem ou continuação).
+  function routeElementsToPages(page, paper, cPaper, split) {
+    const pageOverlay = $('.overlay-layer', paper);
+    const contOverlay = cPaper ? $('.overlay-layer', cPaper) : null;
+    const splitIds = new Set();
+    (page.elements || []).forEach(element => {
+      const node = $(`.editor-element[data-element-id="${CSS.escape(element.id)}"]`);
+      if (!node) return;
+      let target = pageOverlay;
+      let offset = 0;
+      let clip = null;
+      if (split && contOverlay) {
+        const height = element.reflow ? flowBodyHeight(element) : element.h;
+        if (element.y >= split.S - 0.5) {
+          target = contOverlay;
+          offset = split.topC - split.S;
+        } else if (element.reflow && element.y + height > split.S + 0.5) {
+          clip = split.S - element.y;
+          splitIds.add(element.id);
+        }
+      }
+      moveNodePreservingFocus(node, target);
+      node._offsetY = offset;
+      node._clip = clip;
+      applyElementGeometry(node, element);
+      if (clip != null) updateTailView(page, element, contOverlay, split);
+    });
+    if (contOverlay) {
+      $$('.tail-view', contOverlay).forEach(tail => { if (!splitIds.has(tail.dataset.tailOf)) tail.remove(); });
+    }
+  }
+
+  function moveNodePreservingFocus(node, target) {
+    if (!target || node.parentElement === target) return;
+    const active = document.activeElement;
+    const hadFocus = node.contains(active);
+    const selection = window.getSelection();
+    const range = hadFocus && selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null;
+    target.append(node);
+    if (hadFocus) {
+      active.focus({ preventScroll: true });
+      if (range) {
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    }
+  }
+
+  // Vista da parte de baixo do parágrafo dividido, no topo da continuação.
+  function updateTailView(page, element, overlay, split) {
+    let tail = $(`.tail-view[data-tail-of="${CSS.escape(element.id)}"]`, overlay);
+    if (!tail) {
+      tail = document.createElement('div');
+      tail.className = 'editor-element flow tail-view';
+      tail.dataset.tailOf = element.id;
+      tail.dataset.pageId = page.id;
+      tail.dataset.type = 'text';
+      const body = document.createElement('div');
+      body.className = 'element-body';
+      body.contentEditable = state.mode === 'edit' ? 'true' : 'false';
+      body.spellcheck = true;
+      body.addEventListener('focus', () => {
+        activeFlowEditor = body;
+        selectElement(page.id, element.id, false);
+      });
+      body.addEventListener('pointerdown', () => {
+        if (state.mode === 'edit') selectElement(page.id, element.id, false);
+      });
+      body.addEventListener('input', () => {
+        element.html = sanitizeUserHtml(body.innerHTML);
+        const main = $(`.editor-element[data-element-id="${CSS.escape(element.id)}"] .element-body`);
+        if (main) main.innerHTML = element.html;
+        scheduleSessionSave();
+        scheduleCaretHandoff();
+      });
+      body.addEventListener('paste', event => handlePlainPaste(event, body));
+      tail.append(body);
+      overlay.append(tail);
+    }
+    const body = tail.firstChild;
+    if (document.activeElement !== body && body.innerHTML !== sanitizeUserHtml(element.html || '')) body.innerHTML = sanitizeUserHtml(element.html || '');
+    applyTextElementStyle(body, element);
+    const hidden = split.S - element.y;
+    tail.style.left = `${element.x}px`;
+    tail.style.top = `${split.topC}px`;
+    tail.style.width = `${element.w}px`;
+    tail.style.height = `${Math.max(0, flowBodyHeight(element) - hidden)}px`;
+    tail.style.zIndex = String(element.z ?? 1);
+    tail.style.opacity = String(element.opacity ?? 1);
+    body.style.top = `${-hidden}px`;
+  }
+
+  function syncTailViews(element) {
+    $$(`.tail-view[data-tail-of="${CSS.escape(element.id)}"] .element-body`).forEach(body => {
+      if (document.activeElement !== body) body.innerHTML = sanitizeUserHtml(element.html || '');
+      applyTextElementStyle(body, element);
+    });
+  }
+
+  // Quando o cursor entra na parte escondida de uma vista, passa para a outra.
+  function scheduleCaretHandoff() {
+    requestAnimationFrame(() => requestAnimationFrame(handOffCaret));
+  }
+
+  function caretRect(range) {
+    const rects = range.getClientRects();
+    if (rects.length) return rects[rects.length - 1];
+    const probe = document.createElement('span');
+    probe.textContent = '\u200b';
+    const clone = range.cloneRange();
+    clone.insertNode(probe);
+    const rect = probe.getBoundingClientRect();
+    probe.remove();
+    return rect;
+  }
+
+  function nodePath(root, node) {
+    const path = [];
+    while (node && node !== root) {
+      path.unshift([...node.parentNode.childNodes].indexOf(node));
+      node = node.parentNode;
+    }
+    return node === root ? path : null;
+  }
+
+  function nodeAtPath(root, path) {
+    let node = root;
+    for (const index of path) {
+      node = node?.childNodes[index];
+      if (!node) return null;
+    }
+    return node;
+  }
+
+  function handOffCaret() {
+    const selection = window.getSelection();
+    if (!selection.rangeCount || !selection.isCollapsed) return;
+    const range = selection.getRangeAt(0);
+    const container = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer;
+    const body = container?.closest?.('.editor-element.flow .element-body');
+    if (!body) return;
+    const node = body.parentElement;
+    const isTail = node.classList.contains('tail-view');
+    const id = isTail ? node.dataset.tailOf : node.dataset.elementId;
+    const rect = caretRect(range);
+    const box = node.getBoundingClientRect();
+    let target = null;
+    if (!isTail && node._clip != null && rect.top >= box.bottom - 1) target = $(`.tail-view[data-tail-of="${CSS.escape(id)}"] .element-body`);
+    else if (isTail && rect.bottom <= box.top + 1) target = $(`.editor-element[data-element-id="${CSS.escape(id)}"] .element-body`);
+    if (!target) return;
+    const path = nodePath(body, range.startContainer);
+    const twin = path && nodeAtPath(target, path);
+    if (!twin) return;
+    target.focus({ preventScroll: true });
+    const next = document.createRange();
+    next.setStart(twin, Math.min(range.startOffset, twin.nodeType === Node.TEXT_NODE ? twin.length : twin.childNodes.length));
+    next.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(next);
+    target.parentElement.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
   // Move para baixo (ou de volta para cima) os elementos abaixo do corte de um parágrafo.
@@ -1347,7 +1733,8 @@
   function updateReflowElement(page, element, node) {
     const flow = element.reflow;
     if (!flow || pendingReflow.has(element.id) || !node.isConnected) return;
-    const height = node.offsetHeight;
+    // Mede o corpo: o nó pode estar recortado no fim da página.
+    const height = $('.element-body', node)?.offsetHeight || node.offsetHeight;
     if (!height) return;
     element.h = height;
     const push = Math.max(0, Math.round((height - flow.baseH - flow.free) * 100) / 100);
@@ -1361,12 +1748,12 @@
 
   function observeReflowNode(node) {
     reflowObserver ||= new ResizeObserver(entries => entries.forEach(entry => {
-      const target = entry.target;
-      const page = getPage(target.dataset.pageId);
+      const target = entry.target.parentElement;
+      const page = getPage(target?.dataset.pageId);
       const element = page?.elements?.find(item => item.id === target.dataset.elementId);
       if (element?.reflow) updateReflowElement(page, element, target);
     }));
-    reflowObserver.observe(node);
+    reflowObserver.observe($('.element-body', node));
   }
 
   async function loadElementFonts(style) {
@@ -1577,6 +1964,10 @@
       });
       body.addEventListener('input', () => {
         element.html = sanitizeUserHtml(body.innerHTML);
+        if (element.reflow) {
+          syncTailViews(element);
+          scheduleCaretHandoff();
+        }
         scheduleSessionSave();
       });
       body.addEventListener('paste', event => handlePlainPaste(event, body));
@@ -1621,10 +2012,12 @@
   }
 
   function applyElementGeometry(node, element) {
+    // _offsetY: elemento mostrado na página de continuação; _clip: parágrafo dividido no fim da folha.
     node.style.left = `${element.x}px`;
-    node.style.top = `${element.y}px`;
+    node.style.top = `${element.y + (node._offsetY || 0)}px`;
     node.style.width = `${element.w}px`;
-    node.style.height = element.reflow ? 'auto' : `${element.h}px`;
+    node.style.height = element.reflow ? (node._clip != null ? `${node._clip}px` : 'auto') : `${element.h}px`;
+    if (element.reflow && node.firstChild) node.firstChild.style.clipPath = node._clip != null ? `inset(0 0 calc(100% - ${node._clip}px) 0)` : '';
     node.style.opacity = String(element.opacity ?? 1);
     node.style.zIndex = String(element.z ?? 1);
     node.style.transform = element.rotation ? `rotate(${element.rotation}deg)` : '';
@@ -1862,12 +2255,14 @@
     const zoom = state.zoom || 1;
     const dx = (event.clientX - op.startX) / zoom;
     const dy = (event.clientY - op.startY) / zoom;
+    // Elementos mostrados na continuação têm y além da altura da página de origem.
+    const onContinuation = Boolean(op.node._offsetY);
     if (op.type === 'drag') {
       op.element.x = clamp(op.x + dx, 0, op.page.width - op.element.w);
-      op.element.y = clamp(op.y + dy, 0, op.page.height - op.element.h);
+      op.element.y = clamp(op.y + dy, 0, onContinuation ? Infinity : op.page.height - op.element.h);
     } else {
       op.element.w = clamp(op.w + dx, 12, op.page.width - op.element.x);
-      if (!op.element.reflow) op.element.h = clamp(op.h + dy, 12, op.page.height - op.element.y);
+      if (!op.element.reflow) op.element.h = clamp(op.h + dy, 12, onContinuation ? Infinity : op.page.height - op.element.y);
     }
     applyElementGeometry(op.node, op.element);
     updateSelectionInspector();
@@ -1876,6 +2271,7 @@
 
   function endPointerOperation() {
     window.removeEventListener('pointermove', onPointerMove);
+    if (pointerOperation && pageHasReflow(pointerOperation.page)) scheduleReflowCompose(pointerOperation.page);
     pointerOperation = null;
     scheduleSessionSave();
   }
@@ -1969,6 +2365,7 @@
       }
       const body = $(`.editor-element[data-element-id="${CSS.escape(element.id)}"] .element-body`);
       if (body) applyTextElementStyle(body, element);
+      syncTailViews(element);
       scheduleSessionSave();
       updateSelectionInspector();
       return;
@@ -2036,9 +2433,16 @@
     if (!page) return;
     if (activeFlowEditor.classList.contains('flow-editor')) page.html = sanitizeUserHtml(activeFlowEditor.innerHTML);
     else {
-      const id = activeFlowEditor.closest('.editor-element')?.dataset.elementId;
-      const element = page.elements.find(item => item.id === id);
-      if (element) element.html = sanitizeUserHtml(activeFlowEditor.innerHTML);
+      const holder = activeFlowEditor.closest('.editor-element');
+      const id = holder?.dataset.elementId || holder?.dataset.tailOf;
+      const owner = getPage(holder?.dataset.pageId) || page;
+      const element = owner.elements.find(item => item.id === id);
+      if (element) {
+        element.html = sanitizeUserHtml(activeFlowEditor.innerHTML);
+        const main = $(`.editor-element[data-element-id="${CSS.escape(element.id)}"] .element-body`);
+        if (main && main !== activeFlowEditor) main.innerHTML = element.html;
+        if (element.reflow) syncTailViews(element);
+      }
     }
     scheduleSessionSave();
   }
@@ -2145,13 +2549,35 @@
     showToast('Documento A4 criado.');
   }
 
+  // Uma página e a sua continuação andam juntas nas operações de página.
+  function pageBlocks() {
+    const blocks = [];
+    state.pages.forEach(page => {
+      if (page.type === 'continuation' && blocks.length && blocks[blocks.length - 1][0].id === page.parentId) blocks[blocks.length - 1].push(page);
+      else blocks.push([page]);
+    });
+    return blocks;
+  }
+
+  function blockEndIndex(page) {
+    const block = pageBlocks().find(item => item.includes(page));
+    return block ? state.pages.indexOf(block[block.length - 1]) : state.pages.indexOf(page);
+  }
+
+  function refuseContinuation(page) {
+    if (page?.type !== 'continuation') return false;
+    const parentIndex = state.pages.findIndex(item => item.id === page.parentId) + 1;
+    showToast(`Esta página é a continuação da página ${parentIndex} e se ajusta sozinha ao texto.`, 3200);
+    return true;
+  }
+
   function addBlankPage(afterCurrent = true) {
     pushHistory();
     const page = createBlankPage({
       marginPreset: getPage()?.marginPreset || 'normal',
       lineHeight: getPage()?.lineHeight || 1.5
     });
-    const index = afterCurrent && state.currentPageId ? getCurrentPageIndex() + 1 : state.pages.length;
+    const index = afterCurrent && state.currentPageId ? blockEndIndex(getPage()) + 1 : state.pages.length;
     state.pages.splice(index, 0, page);
     state.currentPageId = page.id;
     renderDocument();
@@ -2160,14 +2586,13 @@
 
   function duplicateCurrentPage() {
     const current = getPage();
-    if (!current) return;
+    if (!current || refuseContinuation(current)) return;
     pushHistory();
     const clone = deepClone(current);
     clone.id = uid('page');
     clone.thumb = null;
     clone.elements = (clone.elements || []).map(element => ({ ...element, id: uid(element.type), z: state.nextZ++ }));
-    const index = getCurrentPageIndex() + 1;
-    state.pages.splice(index, 0, clone);
+    state.pages.splice(blockEndIndex(current) + 1, 0, clone);
     state.currentPageId = clone.id;
     renderDocument();
     scheduleSessionSave();
@@ -2175,11 +2600,11 @@
 
   async function deleteCurrentPage() {
     const current = getPage();
-    if (!current) return;
+    if (!current || refuseContinuation(current)) return;
     if (!(await askConfirm('Excluir página?', 'Esta ação remove a página e todas as edições aplicadas nela.', 'Excluir'))) return;
     pushHistory();
     const index = getCurrentPageIndex();
-    state.pages.splice(index, 1);
+    state.pages = state.pages.filter(page => page !== current && page.parentId !== current.id);
     if (!state.pages.length) {
       state.pages.push(createBlankPage());
       state.sourceType = 'blank';
@@ -2192,11 +2617,15 @@
   }
 
   function moveCurrentPage(direction) {
-    const index = getCurrentPageIndex();
+    const current = getPage();
+    if (!current || refuseContinuation(current)) return;
+    const blocks = pageBlocks();
+    const index = blocks.findIndex(block => block[0] === current);
     const target = index + direction;
-    if (target < 0 || target >= state.pages.length) return;
+    if (index < 0 || target < 0 || target >= blocks.length) return;
     pushHistory();
-    [state.pages[index], state.pages[target]] = [state.pages[target], state.pages[index]];
+    [blocks[index], blocks[target]] = [blocks[target], blocks[index]];
+    state.pages = blocks.flat();
     renderDocument();
     scheduleSessionSave();
   }
@@ -2278,6 +2707,7 @@
         const wasRendered = page.type !== 'pdf' || paper?.dataset.rendered === '1';
         const ratioBefore = paper?.dataset.pixelRatio;
         if (page.type === 'pdf') await ensurePdfPageRendered(page.id);
+        if (page.type === 'continuation') await ensurePdfPageRendered(page.parentId);
         updateProgress(`Convertendo página ${i + 1} de ${count}`, 8 + ((i + 1) / count) * 88);
         const canvas = await window.html2canvas(paper, {
           scale: renderScale,
@@ -2298,7 +2728,7 @@
         canvas.height = 1;
         // Páginas redesenhadas em alta resolução só para a exportação são liberadas; as próximas da tela voltam a ser desenhadas depois.
         const ratioChanged = paper?.dataset.pixelRatio !== ratioBefore;
-        if (page.type === 'pdf' && (!wasRendered || ratioChanged) && page.id !== previousPage) releasePdfPageRender(page.id);
+        if (page.type === 'pdf' && (!wasRendered || ratioChanged) && page.id !== previousPage && !continuationOf(page)) releasePdfPageRender(page.id);
         await nextFrame();
       }
 
@@ -2332,9 +2762,10 @@
         const paper = $(`#paper-${CSS.escape(page.id)}`);
         const wasRendered = page.type !== 'pdf' || paper?.dataset.rendered === '1';
         if (page.type === 'pdf') await ensurePdfPageRendered(page.id);
+        if (page.type === 'continuation') await ensurePdfPageRendered(page.parentId);
         updateProgress(`Empacotando página ${i + 1} de ${count}`, 10 + ((i + 1) / count) * 82);
         pagesMarkup.push(buildSnapshotPageHtml(page, i));
-        if (page.type === 'pdf' && !wasRendered && page.id !== state.currentPageId) releasePdfPageRender(page.id);
+        if (page.type === 'pdf' && !wasRendered && page.id !== state.currentPageId && !continuationOf(page)) releasePdfPageRender(page.id);
         await nextFrame();
       }
 
@@ -2366,12 +2797,12 @@
 
   function buildSnapshotPageHtml(page, index) {
     let base = '';
-    if (page.type === 'pdf') {
+    if (page.type === 'pdf' || page.type === 'continuation') {
       const paper = $(`#paper-${CSS.escape(page.id)}`);
       const canvas = $('.pdf-canvas', paper);
       const image = canvas.toDataURL('image/jpeg', .93);
       const textLayer = $('.text-layer', paper)?.cloneNode(true);
-      textLayer?.querySelectorAll('.converted').forEach(node => node.remove());
+      textLayer?.querySelectorAll('.converted, .moved').forEach(node => node.remove());
       if (textLayer) textLayer.removeAttribute('class');
       base = `<img class="page-background" src="${image}" alt="Página ${index + 1}"><div class="searchable-text">${textLayer?.innerHTML || ''}</div>`;
     } else {
@@ -2379,12 +2810,28 @@
       const style = `left:${margins.left}px;top:${margins.top}px;width:${page.width - margins.left - margins.right}px;height:${page.height - margins.top - margins.bottom}px;line-height:${page.lineHeight || 1.5}`;
       base = `<div class="flow-content" style="${style}">${sanitizeUserHtml(page.html || '')}</div>`;
     }
-    const elements = (page.elements || []).map(elementToSnapshotHtml).join('');
+    const elements = page.type === 'blank' ? (page.elements || []).map(element => elementToSnapshotHtml(element)).join('') : overlaySnapshotHtml(page);
     return `<section class="page" style="width:${page.width}px;height:${page.height}px">${base}<div class="overlays">${elements}</div></section>`;
   }
 
-  function elementToSnapshotHtml(element) {
-    const common = `left:${element.x}px;top:${element.y}px;width:${element.w}px;height:${element.h}px;opacity:${element.opacity ?? 1};z-index:${element.z || 1};${element.rotation ? `transform:rotate(${element.rotation}deg);` : ''}`;
+  // Páginas do PDF: os elementos são lidos da tela, já distribuídos entre a página e a continuação.
+  function overlaySnapshotHtml(page) {
+    const paper = $(`#paper-${CSS.escape(page.id)}`);
+    if (!paper) return '';
+    const clipped = (element, x, y, h, inner) => `<div class="snapshot-element" style="left:${x}px;top:${y}px;width:${element.w}px;height:${h}px;overflow:hidden;z-index:${element.z || 1}">${inner}</div>`;
+    return $$('.overlay-layer > .editor-element', paper).map(node => {
+      const tailOf = node.dataset.tailOf;
+      const element = getPage(node.dataset.pageId)?.elements.find(item => item.id === (tailOf || node.dataset.elementId));
+      if (!element) return '';
+      const top = parseFloat(node.style.top);
+      if (tailOf) return clipped(element, element.x, top, parseFloat(node.style.height), elementToSnapshotHtml(element, { x: 0, y: parseFloat(node.firstChild.style.top || 0) }));
+      if (node._clip != null) return clipped(element, element.x, top, node._clip, elementToSnapshotHtml(element, { x: 0, y: 0 }));
+      return elementToSnapshotHtml(element, { y: top });
+    }).join('');
+  }
+
+  function elementToSnapshotHtml(element, at = {}) {
+    const common = `left:${at.x ?? element.x}px;top:${at.y ?? element.y}px;width:${element.w}px;height:${element.h}px;opacity:${element.opacity ?? 1};z-index:${element.z || 1};${element.rotation ? `transform:rotate(${element.rotation}deg);` : ''}`;
     if (element.type === 'text') {
       const style = element.style || {};
       const bodyStyle = `font-family:${(style.fontFamily || 'Arial, sans-serif').replace(/"/g, "'")};font-size:${style.fontSize || 12}px;font-weight:${style.fontWeight || 400};font-style:${style.fontStyle || 'normal'};text-decoration:${style.textDecoration || 'none'};text-align:${style.textAlign || 'left'};color:${style.color || '#111'};background:${style.background || 'transparent'};line-height:${style.lineHeight || 1.2}`
@@ -2680,7 +3127,10 @@
     $('#restoreSessionBtn').addEventListener('click', restoreSavedSession);
     $('#discardSessionBtn').addEventListener('click', clearSavedSession);
 
-    document.addEventListener('selectionchange', saveSelectionRange);
+    document.addEventListener('selectionchange', () => {
+      saveSelectionRange();
+      requestAnimationFrame(handOffCaret);
+    });
     document.addEventListener('keydown', event => {
       const modifier = event.ctrlKey || event.metaKey;
       const inEditableField = Boolean(event.target.closest?.('[contenteditable="true"], input, textarea, select'));

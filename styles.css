@@ -269,6 +269,9 @@ input[type="color"] {
 }
 body.edit-mode .text-layer span:hover { background: rgba(79, 184, 168, .2); outline: 1px solid rgba(79, 184, 168, .55); }
 .text-layer span.converted { opacity: 0; pointer-events: none; }
+/* Trecho que passou para a página de continuação (a cópia de lá é a selecionável). */
+.text-layer span.moved { visibility: hidden; pointer-events: none; }
+.editor-element.tail-view { overflow: hidden; }
 
 .blank-page-base { position: absolute; inset: 0; background: #fff; }
 .flow-editor {

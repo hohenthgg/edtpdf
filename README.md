@@ -75,7 +75,7 @@ Detalhes do ajuste de linhas:
 
 - dentro de uma tabela, o parágrafo usa primeiro o espaço livre que já existe na célula antes de empurrar a tabela;
 - em páginas com colunas lado a lado, só a coluna editada desce;
-- se o conteúdo empurrado passar da margem inferior, a página é alongada para não cortar nada (o conteúdo não passa automaticamente para a página seguinte);
+- se o conteúdo passar da margem inferior, a página mantém o tamanho original e o excesso vai para uma **página de continuação** inserida logo depois. O parágrafo que atravessa o fim da folha é dividido entre as duas páginas e continua editável nos dois lados (o cursor passa de uma para a outra ao digitar); títulos não ficam sozinhos no fim da página; cabeçalhos e rodapés da página original ficam no lugar. A continuação some sozinha quando o excesso deixa de existir, acompanha a página de origem ao mover páginas e entra nas exportações;
 - PDFs feitos com as fontes DejaVu usam as cópias incluídas em `vendor/fonts`; para outras fontes, o editor usa a fonte equivalente do sistema e ajusta o espaçamento para manter as mesmas quebras de linha.
 
 Essa abordagem preserva o visual do PDF e funciona inclusive quando a estrutura interna do arquivo é irregular. Ela não reescreve os objetos internos do PDF original.
